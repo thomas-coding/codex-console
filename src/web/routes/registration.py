@@ -6,10 +6,9 @@ import asyncio
 import logging
 import uuid
 import random
-import re
+import threading
 from datetime import datetime
-from typing import List, Optional, Dict, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from typing import List, Optional, Dict, Tuple, Callable
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -17,7 +16,9 @@ from pydantic import BaseModel, Field
 from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
+from ...core.http_client import HTTPClient, RequestConfig
 from ...core.register import RegistrationEngine, RegistrationResult
+from ...core.proxy_runtime import prepare_runtime_proxy
 from ...services import EmailServiceFactory, EmailServiceType
 from ...config.settings import get_settings
 from ..task_manager import task_manager
@@ -29,71 +30,108 @@ router = APIRouter()
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
-
-
-# ============== Proxy Helper Functions ==============
-
-_IPROYAL_HOST_MARKER = "iproyal.com"
-_IPROYAL_SESSION_PATTERN = re.compile(r"_session-[^_@]+", re.IGNORECASE)
-
-
-def _rewrite_iproyal_sticky_session(proxy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    为 IPRoyal 粘性代理生成新的 session id。
-
-    仅在代理 URL 指向 IPRoyal 且认证信息中包含 `_session-...` 时改写。
-    这样可以保证：
-    - 同一个注册任务内复用同一条 sticky 代理
-    - 不同注册任务自动切换到新的 sticky session / IP
-    """
-    raw_proxy = str(proxy_url or "").strip()
-    if not raw_proxy:
-        return proxy_url, None
-
-    try:
-        parsed = urlsplit(raw_proxy)
-        hostname = str(parsed.hostname or "").strip().lower()
-        if _IPROYAL_HOST_MARKER not in hostname:
-            return raw_proxy, None
-
-        netloc = str(parsed.netloc or "").strip()
-        if not netloc or "@" not in netloc:
-            return raw_proxy, None
-
-        auth, host_part = netloc.rsplit("@", 1)
-        if ":" not in auth:
-            return raw_proxy, None
-
-        username, password = auth.split(":", 1)
-        session_id = uuid.uuid4().hex[:8]
-        rewritten = False
-
-        if _IPROYAL_SESSION_PATTERN.search(username):
-            username = _IPROYAL_SESSION_PATTERN.sub(f"_session-{session_id}", username, count=1)
-            rewritten = True
-        if _IPROYAL_SESSION_PATTERN.search(password):
-            password = _IPROYAL_SESSION_PATTERN.sub(f"_session-{session_id}", password, count=1)
-            rewritten = True
-
-        if not rewritten:
-            return raw_proxy, None
-
-        updated_proxy = urlunsplit((
-            parsed.scheme,
-            f"{username}:{password}@{host_part}",
-            parsed.path,
-            parsed.query,
-            parsed.fragment,
-        ))
-        return updated_proxy, session_id
-    except Exception as exc:
-        logger.warning(f"改写 IPRoyal session 失败，回退原代理: {exc}")
-        return raw_proxy, None
+_registration_proxy_state_lock = threading.Lock()
+_last_registration_public_ip: Optional[str] = None
 
 
 def _prepare_registration_proxy(proxy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """为注册任务准备最终代理 URL。"""
-    return _rewrite_iproyal_sticky_session(proxy_url)
+    return prepare_runtime_proxy(proxy_url)
+
+
+def _resolve_public_ip(proxy_url: Optional[str]) -> Optional[str]:
+    """通过代理查询当前真实出口 IP。"""
+    targets = (
+        "https://api64.ipify.org?format=json",
+        "https://api.ipify.org?format=json",
+    )
+    client = HTTPClient(
+        proxy_url=proxy_url,
+        config=RequestConfig(timeout=10, max_retries=1, retry_delay=0.5),
+    )
+    try:
+        for url in targets:
+            try:
+                response = client.get(url)
+                if response.status_code != 200:
+                    continue
+                payload = response.json()
+                ip = str((payload or {}).get("ip") or "").strip()
+                if ip:
+                    return ip
+            except Exception:
+                continue
+    except Exception:
+        return None
+    finally:
+        client.close()
+    return None
+
+
+def _prepare_registration_proxy_with_ip_check(
+    proxy_url: Optional[str],
+    *,
+    max_attempts: int = 4,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], int, bool]:
+    """
+    为注册任务准备代理，并尽量避免与上一任务复用同一个真实出口 IP。
+
+    Returns:
+        (final_proxy_url, session_id, public_ip, attempts, forced_reuse)
+    """
+    global _last_registration_public_ip
+
+    base_proxy = proxy_url
+    attempts = 0
+    final_proxy = proxy_url
+    final_session_id = None
+    final_public_ip = None
+    forced_reuse = False
+
+    def emit_log(message: str):
+        if log_callback:
+            log_callback(message)
+
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        candidate_proxy, session_id = _prepare_registration_proxy(base_proxy)
+        public_ip = _resolve_public_ip(candidate_proxy)
+        attempt_parts = [f"[系统] 代理准备第 {attempt}/{max_attempts} 次"]
+        if session_id:
+            attempt_parts.append(f"session={session_id}")
+        if public_ip:
+            attempt_parts.append(f"出口IP={public_ip}")
+        else:
+            attempt_parts.append("出口IP=未知")
+        emit_log("，".join(attempt_parts))
+
+        with _registration_proxy_state_lock:
+            previous_ip = _last_registration_public_ip
+            same_as_previous = bool(public_ip and previous_ip and public_ip == previous_ip)
+            can_retry = bool(session_id) and attempt < max_attempts
+
+            final_proxy = candidate_proxy
+            final_session_id = session_id
+            final_public_ip = public_ip
+
+            if same_as_previous and can_retry:
+                logger.warning(
+                    "注册任务代理出口 IP 与上一任务重复，重试切换 session: ip=%s, session=%s, attempt=%s/%s",
+                    public_ip,
+                    session_id,
+                    attempt,
+                    max_attempts,
+                )
+                emit_log(f"[警告] 当前出口 IP 与上一任务相同 ({public_ip})，继续切换新 session 重试")
+                continue
+
+            if public_ip:
+                _last_registration_public_ip = public_ip
+            forced_reuse = same_as_previous
+            break
+
+    return final_proxy, final_session_id, final_public_ip, attempts, forced_reuse
 
 
 def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
@@ -327,11 +365,32 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 if actual_proxy_url:
                     logger.info(f"任务 {task_uuid} 使用代理: {actual_proxy_url[:50]}...")
 
-            actual_proxy_url, iproyal_session_id = _prepare_registration_proxy(actual_proxy_url)
+            def _task_proxy_log(message: str):
+                task_manager.add_log(task_uuid, f"{log_prefix} {message}" if log_prefix else message)
+
+            actual_proxy_url, iproyal_session_id, public_ip, proxy_prepare_attempts, forced_reuse = _prepare_registration_proxy_with_ip_check(
+                actual_proxy_url,
+                log_callback=_task_proxy_log,
+            )
             if iproyal_session_id:
                 logger.info(f"任务 {task_uuid} 使用新的 IPRoyal sticky session: {iproyal_session_id}")
                 session_msg = f"[系统] IPRoyal 粘性代理已切换新会话: {iproyal_session_id}"
-                task_manager.add_log(task_uuid, f"{log_prefix} {session_msg}" if log_prefix else session_msg)
+                _task_proxy_log(session_msg)
+            if public_ip:
+                logger.info(f"任务 {task_uuid} 当前真实出口 IP: {public_ip}")
+                ip_msg = f"[系统] 当前真实出口 IP: {public_ip}"
+                _task_proxy_log(ip_msg)
+            else:
+                logger.warning(f"任务 {task_uuid} 未能解析真实出口 IP")
+                ip_msg = "[警告] 未能解析当前真实出口 IP，将继续使用当前代理"
+                _task_proxy_log(ip_msg)
+            if proxy_prepare_attempts > 1:
+                retry_msg = f"[系统] 为避免复用上一任务 IP，代理会话已重试 {proxy_prepare_attempts} 次"
+                _task_proxy_log(retry_msg)
+            if forced_reuse and public_ip:
+                reuse_msg = f"[警告] 多次切换后仍复用上一任务出口 IP: {public_ip}"
+                logger.warning("任务 %s %s", task_uuid, reuse_msg)
+                _task_proxy_log(reuse_msg)
 
             # 更新任务的代理记录
             crud.update_registration_task(db, task_uuid, proxy=actual_proxy_url)

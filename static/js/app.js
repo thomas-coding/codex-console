@@ -14,6 +14,8 @@ let todayStatsResetInterval = null;
 let isBatchMode = false;
 let isOutlookBatchMode = false;
 let outlookAccounts = [];
+let csvCpaFiles = [];
+let selectedCsvCpaFilename = '';
 let taskCompleted = false;  // 标记任务是否已完成
 let batchCompleted = false;  // 标记批量任务是否已完成
 let taskFinalStatus = null;  // 保存任务的最终状态
@@ -51,6 +53,9 @@ const WS_RECONNECT_MAX_DELAY = 10000;
 // DOM 元素
 const elements = {
     form: document.getElementById('registration-form'),
+    taskType: document.getElementById('task-type'),
+    registrationSettingsSection: document.getElementById('registration-settings-section'),
+    csvCpaSection: document.getElementById('csv-cpa-section'),
     emailService: document.getElementById('email-service'),
     regMode: document.getElementById('reg-mode'),
     regModeGroup: document.getElementById('reg-mode-group'),
@@ -112,11 +117,20 @@ const elements = {
     autoUploadTm: document.getElementById('auto-upload-tm'),
     tmServiceSelectGroup: document.getElementById('tm-service-select-group'),
     tmServiceSelect: document.getElementById('tm-service-select'),
+    csvCpaDirectory: document.getElementById('csv-cpa-directory'),
+    csvCpaFileList: document.getElementById('csv-cpa-file-list'),
+    refreshCsvFilesBtn: document.getElementById('refresh-csv-files-btn'),
+    csvCpaUploadInput: document.getElementById('csv-cpa-upload-input'),
+    selectCsvUploadBtn: document.getElementById('select-csv-upload-btn'),
+    csvCpaUploadName: document.getElementById('csv-cpa-upload-name'),
+    csvCpaRotateProxy: document.getElementById('csv-cpa-rotate-proxy'),
+    csvCpaDownloadBtn: document.getElementById('csv-cpa-download-btn'),
 };
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
     initEventListeners();
+    updateTaskTypeUI();
     loadAvailableServices();
     loadRecentAccounts();
     startAccountsPolling();
@@ -124,6 +138,7 @@ document.addEventListener('DOMContentLoaded', () => {
     startTodayStatsPolling();
     startTodayStatsResetTicker();
     initVisibilityReconnect();
+    restoreCsvCpaDownloadState();
     restoreActiveTask();
     initAutoUploadOptions();
 });
@@ -211,6 +226,9 @@ function initEventListeners() {
     // 注册表单提交
     elements.form.addEventListener('submit', handleStartRegistration);
 
+    // 任务类型切换
+    elements.taskType.addEventListener('change', handleTaskTypeChange);
+
     // 注册模式切换
     elements.regMode.addEventListener('change', handleModeChange);
 
@@ -239,6 +257,97 @@ function initEventListeners() {
     elements.outlookConcurrencyMode.addEventListener('change', () => {
         handleConcurrencyModeChange(elements.outlookConcurrencyMode, elements.outlookConcurrencyHint, elements.outlookIntervalGroup);
     });
+
+    // CSV->CPA
+    elements.refreshCsvFilesBtn.addEventListener('click', loadCsvCpaFiles);
+    elements.selectCsvUploadBtn.addEventListener('click', () => elements.csvCpaUploadInput.click());
+    elements.csvCpaUploadInput.addEventListener('change', updateSelectedCsvUpload);
+    elements.csvCpaDownloadBtn.addEventListener('click', handleCsvCpaDownload);
+}
+
+function getCurrentTaskType() {
+    return elements.taskType ? elements.taskType.value : 'registration';
+}
+
+function getCurrentBatchMode() {
+    if (currentBatch && currentBatch.pollingMode) {
+        return currentBatch.pollingMode;
+    }
+    if (isOutlookBatchMode) {
+        return 'outlook_batch';
+    }
+    if (getCurrentTaskType() === 'csv_cpa') {
+        return 'csv_cpa_batch';
+    }
+    return 'batch';
+}
+
+function getBatchLabels(mode = getCurrentBatchMode()) {
+    if (mode === 'outlook_batch') {
+        return {
+            completionPrefix: 'Outlook 批量任务',
+            successToast: (count) => `Outlook 批量注册完成，成功 ${count} 个`,
+            zeroSuccessToast: 'Outlook 批量注册完成，但没有成功注册任何账号',
+            failedToast: '批量任务执行失败',
+            cancelledLog: '[警告] 批量任务已取消',
+            progressSuccess: (count) => `[成功] 第 ${count} 个账号注册成功`,
+            progressFailed: (count) => `[失败] 第 ${count} 个账号注册失败`,
+        };
+    }
+
+    if (mode === 'csv_cpa_batch') {
+        return {
+            completionPrefix: 'CSV->CPA 任务',
+            successToast: (count) => `CSV->CPA 处理完成，成功 ${count} 个`,
+            zeroSuccessToast: 'CSV->CPA 处理完成，但没有生成可导出的文件',
+            failedToast: 'CSV->CPA 任务执行失败',
+            cancelledLog: '[警告] CSV->CPA 任务已取消',
+            progressSuccess: (count) => `[成功] 第 ${count} 个账号处理成功`,
+            progressFailed: (count) => `[失败] 第 ${count} 个账号处理失败`,
+        };
+    }
+
+    return {
+        completionPrefix: '批量任务',
+        successToast: (count) => `批量注册完成，成功 ${count} 个`,
+        zeroSuccessToast: '批量注册完成，但没有成功注册任何账号',
+        failedToast: '批量任务执行失败',
+        cancelledLog: '[警告] 批量任务已取消',
+        progressSuccess: (count) => `[成功] 第 ${count} 个账号注册成功`,
+        progressFailed: (count) => `[失败] 第 ${count} 个账号注册失败`,
+    };
+}
+
+function handleTaskTypeChange() {
+    updateTaskTypeUI();
+}
+
+function updateTaskTypeUI() {
+    const isCsvCpa = getCurrentTaskType() === 'csv_cpa';
+
+    if (elements.registrationSettingsSection) {
+        elements.registrationSettingsSection.style.display = isCsvCpa ? 'none' : 'block';
+    }
+    if (elements.csvCpaSection) {
+        elements.csvCpaSection.style.display = isCsvCpa ? 'block' : 'none';
+    }
+    if (elements.csvCpaDownloadBtn) {
+        elements.csvCpaDownloadBtn.style.display = isCsvCpa ? 'block' : 'none';
+    }
+    if (elements.startBtn) {
+        elements.startBtn.textContent = isCsvCpa ? '开始处理' : '🚀 开始注册';
+    }
+
+    if (isCsvCpa) {
+        isOutlookBatchMode = false;
+        isBatchMode = false;
+        if (!csvCpaFiles.length) {
+            loadCsvCpaFiles();
+        }
+    } else {
+        handleServiceChange({ target: elements.emailService });
+        handleModeChange({ target: elements.regMode });
+    }
 }
 
 // 加载可用的邮箱服务
@@ -473,6 +582,181 @@ function handleModeChange(e) {
     elements.batchOptions.style.display = isBatchMode ? 'block' : 'none';
 }
 
+async function loadCsvCpaFiles() {
+    if (!elements.csvCpaDirectory || !elements.csvCpaFileList) return;
+
+    elements.csvCpaDirectory.textContent = '加载中...';
+    elements.csvCpaFileList.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:16px 0;">加载中...</div>';
+
+    try {
+        const data = await api.get('/accounts/csv-files');
+        csvCpaFiles = data.files || [];
+        elements.csvCpaDirectory.textContent = data.directory || 'csv';
+        renderCsvCpaFiles();
+    } catch (error) {
+        console.error('加载 CSV 文件失败:', error);
+        elements.csvCpaDirectory.textContent = '加载失败';
+        elements.csvCpaFileList.innerHTML = `<div style="text-align:center;color:var(--danger-color);padding:16px 0;">${escapeHtml(error.message || '加载失败')}</div>`;
+    }
+}
+
+function renderCsvCpaFiles() {
+    if (!elements.csvCpaFileList) return;
+
+    if (!csvCpaFiles.length) {
+        selectedCsvCpaFilename = '';
+        elements.csvCpaFileList.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:16px 0;">csv 目录下暂无可用文件</div>';
+        return;
+    }
+
+    const filenames = csvCpaFiles.map(item => item.name);
+    if (!selectedCsvCpaFilename || !filenames.includes(selectedCsvCpaFilename)) {
+        selectedCsvCpaFilename = filenames[0];
+    }
+
+    elements.csvCpaFileList.innerHTML = csvCpaFiles.map(file => {
+        const checked = file.name === selectedCsvCpaFilename ? 'checked' : '';
+        return `
+            <label style="
+                display:flex;
+                align-items:flex-start;
+                gap:10px;
+                padding:10px 12px;
+                border:1px solid var(--border);
+                border-radius:10px;
+                background:var(--surface);
+                cursor:pointer;
+            ">
+                <input type="radio" name="csv-cpa-file" value="${escapeHtml(file.name)}" ${checked} style="margin-top:4px;">
+                <div style="min-width:0;display:flex;flex-direction:column;gap:4px;">
+                    <div style="font-weight:600;word-break:break-all;">${escapeHtml(file.name)}</div>
+                    <div style="font-size:0.82rem;color:var(--text-muted);display:flex;gap:10px;flex-wrap:wrap;">
+                        <span>记录数: ${file.record_count == null ? '解析失败' : format.number(file.record_count)}</span>
+                        <span>大小: ${format.bytes(file.size || 0)}</span>
+                        <span>修改时间: ${format.date(file.modified_at)}</span>
+                    </div>
+                </div>
+            </label>
+        `;
+    }).join('');
+
+    elements.csvCpaFileList.querySelectorAll('input[name="csv-cpa-file"]').forEach(input => {
+        input.addEventListener('change', () => {
+            if (input.checked) {
+                selectedCsvCpaFilename = input.value;
+                if (elements.csvCpaUploadInput) {
+                    elements.csvCpaUploadInput.value = '';
+                }
+                if (elements.csvCpaUploadName) {
+                    elements.csvCpaUploadName.textContent = '未选择文件';
+                }
+                addLog('info', `[系统] 已选择 CSV 文件: ${input.value}`);
+            }
+        });
+    });
+}
+
+function updateSelectedCsvUpload() {
+    const file = elements.csvCpaUploadInput && elements.csvCpaUploadInput.files ? elements.csvCpaUploadInput.files[0] : null;
+    if (elements.csvCpaUploadName) {
+        elements.csvCpaUploadName.textContent = file ? file.name : '未选择文件';
+    }
+    if (file) {
+        selectedCsvCpaFilename = '';
+        const selectedRadio = document.querySelector('input[name="csv-cpa-file"]:checked');
+        if (selectedRadio) {
+            selectedRadio.checked = false;
+        }
+        addLog('info', `[系统] 已选择上传 CSV: ${file.name}`);
+    }
+}
+
+function extractFilenameFromDisposition(disposition, fallbackName) {
+    if (!disposition) return fallbackName;
+    const match = disposition.match(/filename=\"?([^\"]+)\"?/i);
+    return match ? match[1] : fallbackName;
+}
+
+async function downloadResponse(response, fallbackName) {
+    if (!response.ok) {
+        let message = `HTTP ${response.status}`;
+        try {
+            const errorData = await response.json();
+            const detail = errorData.detail || errorData.message || message;
+            message = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
+        } catch (error) {
+            const text = await response.text();
+            if (text) message = text;
+        }
+        throw new Error(message);
+    }
+
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition');
+    const filename = extractFilenameFromDisposition(disposition, fallbackName);
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+}
+
+function setCsvCpaDownloadState(enabled, batchId = '', filename = '') {
+    if (!elements.csvCpaDownloadBtn) return;
+
+    elements.csvCpaDownloadBtn.disabled = !enabled;
+    elements.csvCpaDownloadBtn.dataset.batchId = enabled ? batchId : '';
+    elements.csvCpaDownloadBtn.dataset.filename = enabled ? filename : '';
+    elements.csvCpaDownloadBtn.textContent = enabled
+        ? `保存 CPA 文件${filename ? ` (${filename})` : ''}`
+        : '保存 CPA 文件';
+
+    if (enabled && batchId) {
+        sessionStorage.setItem('csvCpaDownload', JSON.stringify({ batch_id: batchId, filename }));
+    } else {
+        sessionStorage.removeItem('csvCpaDownload');
+    }
+}
+
+function restoreCsvCpaDownloadState() {
+    const saved = sessionStorage.getItem('csvCpaDownload');
+    if (!saved) return;
+
+    try {
+        const data = JSON.parse(saved);
+        if (data.batch_id) {
+            if (elements.taskType) {
+                elements.taskType.value = 'csv_cpa';
+                updateTaskTypeUI();
+            }
+            setCsvCpaDownloadState(true, data.batch_id, data.filename || '');
+        }
+    } catch {
+        sessionStorage.removeItem('csvCpaDownload');
+    }
+}
+
+async function handleCsvCpaDownload() {
+    const batchId = elements.csvCpaDownloadBtn ? elements.csvCpaDownloadBtn.dataset.batchId : '';
+    const filename = elements.csvCpaDownloadBtn ? elements.csvCpaDownloadBtn.dataset.filename : '';
+    if (!batchId) {
+        toast.warning('当前没有可保存的 CPA 文件');
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/accounts/export/cpa-task/${batchId}/download`);
+        await downloadResponse(response, filename || 'cpa_tokens.zip');
+        toast.success('CPA 文件已保存');
+    } catch (error) {
+        console.error('下载 CPA 文件失败:', error);
+        toast.error(`下载失败: ${error.message}`);
+    }
+}
+
 // 并发模式切换（批量）
 function handleConcurrencyModeChange(selectEl, hintEl, intervalGroupEl) {
     const mode = selectEl.value;
@@ -488,6 +772,11 @@ function handleConcurrencyModeChange(selectEl, hintEl, intervalGroupEl) {
 // 开始注册
 async function handleStartRegistration(e) {
     e.preventDefault();
+
+    if (getCurrentTaskType() === 'csv_cpa') {
+        await handleCsvCpaBatchTask();
+        return;
+    }
 
     const selectedValue = elements.emailService.value;
     if (!selectedValue) {
@@ -530,6 +819,82 @@ async function handleStartRegistration(e) {
         await handleBatchRegistration(requestData);
     } else {
         await handleSingleRegistration(requestData);
+    }
+}
+
+async function handleCsvCpaBatchTask() {
+    batchCompleted = false;
+    batchFinalStatus = null;
+    displayedLogs.clear();
+    toastShown = false;
+    setCsvCpaDownloadState(false);
+
+    const uploadFile = elements.csvCpaUploadInput && elements.csvCpaUploadInput.files
+        ? elements.csvCpaUploadInput.files[0]
+        : null;
+    const rotateProxy = elements.csvCpaRotateProxy ? elements.csvCpaRotateProxy.checked : true;
+
+    if (!uploadFile && !selectedCsvCpaFilename) {
+        toast.error('请先选择一个 CSV 文件');
+        return;
+    }
+
+    elements.startBtn.disabled = true;
+    elements.cancelBtn.disabled = false;
+    elements.consoleLog.innerHTML = '';
+
+    const sourceName = uploadFile ? uploadFile.name : selectedCsvCpaFilename;
+    addLog('info', `[系统] 正在启动 CSV->CPA 处理任务: ${sourceName}`);
+
+    try {
+        let data;
+        if (uploadFile) {
+            const formData = new FormData();
+            formData.append('file', uploadFile);
+            formData.append('rotate_proxy_per_record', rotateProxy ? 'true' : 'false');
+
+            const response = await fetch('/api/accounts/export/cpa-from-csv-task-upload', {
+                method: 'POST',
+                body: formData,
+            });
+            if (!response.ok) {
+                let message = `HTTP ${response.status}`;
+                try {
+                    const errorData = await response.json();
+                    const detail = errorData.detail || errorData.message || message;
+                    message = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
+                } catch (error) {
+                    const text = await response.text();
+                    if (text) message = text;
+                }
+                throw new Error(message);
+            }
+            data = await response.json();
+        } else {
+            data = await api.post('/accounts/export/cpa-from-csv-task-file', {
+                filename: selectedCsvCpaFilename,
+                rotate_proxy_per_record: rotateProxy,
+            });
+        }
+
+        currentBatch = { batch_id: data.batch_id, ...data, pollingMode: 'csv_cpa_batch' };
+        activeBatchId = data.batch_id;
+        sessionStorage.setItem('activeTask', JSON.stringify({
+            batch_id: data.batch_id,
+            mode: 'csv_cpa_batch',
+            total: data.total,
+        }));
+
+        addLog('info', `[系统] CSV->CPA 任务已创建: ${data.batch_id}`);
+        addLog('info', `[系统] 来源文件: ${data.source_name || sourceName}`);
+        addLog('info', `[系统] 总记录数: ${data.total}`);
+
+        showBatchStatus({ count: data.total });
+        connectBatchWebSocket(data.batch_id);
+    } catch (error) {
+        addLog('error', `[错误] 启动失败: ${error.message}`);
+        toast.error(error.message);
+        resetButtons();
     }
 }
 
@@ -622,10 +987,15 @@ function startCurrentBatchPolling(batchId) {
 
     const pollingMode = currentBatch && currentBatch.batch_id === batchId
         ? currentBatch.pollingMode
-        : (isOutlookBatchMode ? 'outlook_batch' : 'batch');
+        : getCurrentBatchMode();
 
     if (pollingMode === 'outlook_batch') {
         startOutlookBatchPolling(batchId);
+        return;
+    }
+
+    if (pollingMode === 'csv_cpa_batch') {
+        startCsvCpaBatchPolling(batchId);
         return;
     }
 
@@ -837,8 +1207,10 @@ async function handleCancelTask() {
     addLog('info', '[系统] 正在提交取消请求...');
 
     try {
-        // 批量任务取消（包括普通批量模式和 Outlook 批量模式）
-        if (currentBatch && (isBatchMode || isOutlookBatchMode)) {
+        const pollingMode = currentBatch ? currentBatch.pollingMode : '';
+
+        // 批量任务取消（普通批量 / Outlook 批量 / CSV->CPA）
+        if (currentBatch && pollingMode) {
             // 优先通过 WebSocket 取消
             if (batchWebSocket && batchWebSocket.readyState === WebSocket.OPEN) {
                 batchWebSocket.send(JSON.stringify({ type: 'cancel' }));
@@ -846,9 +1218,12 @@ async function handleCancelTask() {
                 toast.info('任务取消请求已提交');
             } else {
                 // 降级到 REST API
-                const endpoint = isOutlookBatchMode
-                    ? `/registration/outlook-batch/${currentBatch.batch_id}/cancel`
-                    : `/registration/batch/${currentBatch.batch_id}/cancel`;
+                let endpoint = `/registration/batch/${currentBatch.batch_id}/cancel`;
+                if (pollingMode === 'outlook_batch') {
+                    endpoint = `/registration/outlook-batch/${currentBatch.batch_id}/cancel`;
+                } else if (pollingMode === 'csv_cpa_batch') {
+                    endpoint = `/accounts/export/cpa-task/${currentBatch.batch_id}/cancel`;
+                }
 
                 await api.post(endpoint);
                 addLog('warning', '[警告] 批量任务取消请求已提交');
@@ -963,25 +1338,13 @@ function startBatchPolling(batchId) {
     batchPollingInterval = setInterval(async () => {
         try {
             const data = await api.get(`/registration/batch/${batchId}`);
+            syncCurrentBatchStatus(data);
             updateBatchProgress(data);
 
             // 检查是否完成
             if (data.finished) {
                 stopBatchPolling();
-                resetButtons();
-
-                // 只显示一次 toast
-                if (!toastShown) {
-                    toastShown = true;
-                    addLog('info', `[完成] 批量任务完成！成功: ${data.success}, 失败: ${data.failed}`);
-                    if (data.success > 0) {
-                        toast.success(`批量注册完成，成功 ${data.success} 个`);
-                        // 刷新账号列表
-                        loadRecentAccounts();
-                    } else {
-                        toast.warning('批量注册完成，但没有成功注册任何账号');
-                    }
-                }
+                handleBatchTerminalStatus(data, 'batch');
             }
         } catch (error) {
             console.error('轮询批量状态失败:', error);
@@ -1042,7 +1405,9 @@ function showBatchStatus(batch) {
 
 // 更新批量进度
 function updateBatchProgress(data) {
-    const progress = ((data.completed / data.total) * 100).toFixed(0);
+    const safeTotal = Math.max(Number(data.total) || 0, 1);
+    const progress = ((Number(data.completed) || 0) / safeTotal * 100).toFixed(0);
+    const labels = getBatchLabels();
     elements.batchProgressText.textContent = `${data.completed}/${data.total}`;
     elements.batchProgressPercent.textContent = `${progress}%`;
     elements.progressBar.style.width = `${progress}%`;
@@ -1056,10 +1421,10 @@ function updateBatchProgress(data) {
         const lastFailed = parseInt(elements.batchFailed.dataset.last || '0');
 
         if (data.success > lastSuccess) {
-            addLog('success', `[成功] 第 ${data.success} 个账号注册成功`);
+            addLog('success', labels.progressSuccess(data.success));
         }
         if (data.failed > lastFailed) {
-            addLog('error', `[失败] 第 ${data.failed} 个账号注册失败`);
+            addLog('error', labels.progressFailed(data.failed));
         }
 
         elements.batchSuccess.dataset.last = data.success;
@@ -1273,7 +1638,7 @@ function resetButtons() {
     clearBatchWebSocketReconnect();
     currentTask = null;
     currentBatch = null;
-    isBatchMode = false;
+    isBatchMode = elements.regMode ? elements.regMode.value === 'batch' : false;
     // 重置完成标志
     taskCompleted = false;
     batchCompleted = false;
@@ -1450,6 +1815,54 @@ async function handleOutlookBatchRegistration() {
 
 // ============== 批量任务 WebSocket 功能 ==============
 
+function syncCurrentBatchStatus(data) {
+    if (!currentBatch) return;
+    currentBatch = { ...currentBatch, ...data };
+
+    if (currentBatch.pollingMode === 'csv_cpa_batch' && data.download_ready) {
+        setCsvCpaDownloadState(true, currentBatch.batch_id, data.filename || '');
+    }
+}
+
+function handleBatchTerminalStatus(data, mode) {
+    const labels = getBatchLabels(mode);
+    batchFinalStatus = data.status;
+    batchCompleted = true;
+
+    if (mode === 'csv_cpa_batch' && data.download_ready) {
+        setCsvCpaDownloadState(true, data.batch_id || activeBatchId, data.filename || '');
+    }
+
+    disconnectBatchWebSocket();
+    resetButtons();
+
+    if (toastShown) return;
+    toastShown = true;
+
+    if (data.status === 'completed') {
+        addLog('success', `[完成] ${labels.completionPrefix}完成！成功: ${data.success}, 失败: ${data.failed}`);
+        if (data.success > 0) {
+            toast.success(labels.successToast(data.success));
+            if (mode !== 'csv_cpa_batch') {
+                loadRecentAccounts();
+            }
+        } else {
+            toast.warning(labels.zeroSuccessToast);
+        }
+        return;
+    }
+
+    if (data.status === 'failed') {
+        addLog('error', `[错误] ${labels.failedToast}`);
+        toast.error(labels.failedToast);
+        return;
+    }
+
+    if (data.status === 'cancelled' || data.status === 'cancelling') {
+        addLog('warning', labels.cancelledLog);
+    }
+}
+
 // 连接批量任务 WebSocket
 function connectBatchWebSocket(batchId) {
     activeBatchId = batchId;
@@ -1484,11 +1897,15 @@ function connectBatchWebSocket(batchId) {
         socket.onmessage = (event) => {
             if (batchWebSocket !== socket) return;
             const data = JSON.parse(event.data);
+            const mode = currentBatch && currentBatch.batch_id === batchId
+                ? currentBatch.pollingMode
+                : getCurrentBatchMode();
 
             if (data.type === 'log') {
                 const logType = getLogType(data.message);
                 addLog(logType, data.message);
             } else if (data.type === 'status') {
+                syncCurrentBatchStatus(data);
                 // 更新进度
                 if (data.total !== undefined) {
                     updateBatchProgress({
@@ -1501,34 +1918,7 @@ function connectBatchWebSocket(batchId) {
 
                 // 检查是否完成
                 if (['completed', 'failed', 'cancelled', 'cancelling'].includes(data.status)) {
-                    // 保存最终状态，用于 onclose 判断
-                    batchFinalStatus = data.status;
-                    batchCompleted = true;
-
-                    // 断开 WebSocket（异步操作）
-                    disconnectBatchWebSocket();
-
-                    // 任务完成后再重置按钮
-                    resetButtons();
-
-                    // 只显示一次 toast
-                    if (!toastShown) {
-                        toastShown = true;
-                        if (data.status === 'completed') {
-                            addLog('success', `[完成] Outlook 批量任务完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
-                            if (data.success > 0) {
-                                toast.success(`Outlook 批量注册完成，成功 ${data.success} 个`);
-                                loadRecentAccounts();
-                            } else {
-                                toast.warning('Outlook 批量注册完成，但没有成功注册任何账号');
-                            }
-                        } else if (data.status === 'failed') {
-                            addLog('error', '[错误] 批量任务执行失败');
-                            toast.error('批量任务执行失败');
-                        } else if (data.status === 'cancelled' || data.status === 'cancelling') {
-                            addLog('warning', '[警告] 批量任务已取消');
-                        }
-                    }
+                    handleBatchTerminalStatus(data, mode);
                 }
             } else if (data.type === 'pong') {
                 // 心跳响应，忽略
@@ -1615,6 +2005,7 @@ function startOutlookBatchPolling(batchId) {
     batchPollingInterval = setInterval(async () => {
         try {
             const data = await api.get(`/registration/outlook-batch/${batchId}`);
+            syncCurrentBatchStatus(data);
 
             // 更新进度
             updateBatchProgress({
@@ -1638,22 +2029,43 @@ function startOutlookBatchPolling(batchId) {
             // 检查是否完成
             if (data.finished) {
                 stopBatchPolling();
-                resetButtons();
-
-                // 只显示一次 toast
-                if (!toastShown) {
-                    toastShown = true;
-                    addLog('info', `[完成] Outlook 批量任务完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
-                    if (data.success > 0) {
-                        toast.success(`Outlook 批量注册完成，成功 ${data.success} 个`);
-                        loadRecentAccounts();
-                    } else {
-                        toast.warning('Outlook 批量注册完成，但没有成功注册任何账号');
-                    }
-                }
+                handleBatchTerminalStatus(data, 'outlook_batch');
             }
         } catch (error) {
             console.error('轮询 Outlook 批量状态失败:', error);
+        }
+    }, 2000);
+
+    batchPollingInterval.lastLogIndex = 0;
+}
+
+function startCsvCpaBatchPolling(batchId) {
+    if (batchPollingInterval) {
+        return;
+    }
+
+    batchPollingInterval = setInterval(async () => {
+        try {
+            const data = await api.get(`/accounts/export/cpa-task/${batchId}`);
+            syncCurrentBatchStatus(data);
+            updateBatchProgress(data);
+
+            if (data.logs && data.logs.length > 0) {
+                const lastLogIndex = batchPollingInterval.lastLogIndex || 0;
+                for (let i = lastLogIndex; i < data.logs.length; i++) {
+                    const log = data.logs[i];
+                    const logType = getLogType(log);
+                    addLog(logType, log);
+                }
+                batchPollingInterval.lastLogIndex = data.logs.length;
+            }
+
+            if (data.finished) {
+                stopBatchPolling();
+                handleBatchTerminalStatus(data, 'csv_cpa_batch');
+            }
+        } catch (error) {
+            console.error('轮询 CSV->CPA 状态失败:', error);
         }
     }, 2000);
 
@@ -1725,14 +2137,25 @@ async function restoreActiveTask() {
         } catch {
             sessionStorage.removeItem('activeTask');
         }
-    } else if ((mode === 'batch' || mode === 'outlook_batch') && batch_id) {
+    } else if ((mode === 'batch' || mode === 'outlook_batch' || mode === 'csv_cpa_batch') && batch_id) {
         // 查询批量任务是否仍在运行
-        const endpoint = mode === 'outlook_batch'
-            ? `/registration/outlook-batch/${batch_id}`
-            : `/registration/batch/${batch_id}`;
+        let endpoint = `/registration/batch/${batch_id}`;
+        if (mode === 'outlook_batch') {
+            endpoint = `/registration/outlook-batch/${batch_id}`;
+        } else if (mode === 'csv_cpa_batch') {
+            endpoint = `/accounts/export/cpa-task/${batch_id}`;
+        }
         try {
             const data = await api.get(endpoint);
             if (data.finished) {
+                if (mode === 'csv_cpa_batch' && data.download_ready) {
+                    if (elements.taskType) {
+                        elements.taskType.value = 'csv_cpa';
+                        updateTaskTypeUI();
+                    }
+                    setCsvCpaDownloadState(true, batch_id, data.filename || '');
+                    addLog('info', `[系统] 检测到已完成的 CSV->CPA 任务，可直接保存文件: ${data.filename || batch_id}`);
+                }
                 sessionStorage.removeItem('activeTask');
                 return;
             }
@@ -1740,6 +2163,13 @@ async function restoreActiveTask() {
             currentBatch = { batch_id, ...data, pollingMode: mode };
             activeBatchId = batch_id;
             isOutlookBatchMode = (mode === 'outlook_batch');
+            if (mode === 'csv_cpa_batch' && elements.taskType) {
+                elements.taskType.value = 'csv_cpa';
+                updateTaskTypeUI();
+            }
+            if (mode === 'csv_cpa_batch') {
+                setCsvCpaDownloadState(false);
+            }
             batchCompleted = false;
             batchFinalStatus = null;
             toastShown = false;

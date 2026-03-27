@@ -303,6 +303,15 @@
                         <div class="card-body">
                             <form id="registration-form">
                                 <div class="form-group">
+                                    <label for="task-type">任务类型</label>
+                                    <select id="task-type" name="task_type">
+                                        <option value="registration">注册任务</option>
+                                        <option value="csv_cpa">CSV 转 CPA</option>
+                                    </select>
+                                </div>
+
+                                <div id="registration-settings-section">
+                                <div class="form-group">
                                     <label for="email-service">邮箱服务</label>
                                     <select id="email-service" name="email_service" required>
                                         <option value="tempmail:default">Tempmail.lol (临时邮箱)</option>
@@ -432,6 +441,39 @@
                                         <div class="multi-select-dropdown" id="tm-service-select"></div>
                                     </div>
                                 </div>
+                                </div>
+
+                                <div id="csv-cpa-section" style="display: none;">
+                                    <div class="form-group">
+                                        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+                                            <div>
+                                                <label style="margin-bottom: 2px;">项目 CSV 文件</label>
+                                                <div id="csv-cpa-directory" style="font-size: 0.82rem; color: var(--text-muted);">加载中...</div>
+                                            </div>
+                                            <button type="button" class="btn btn-ghost btn-sm" id="refresh-csv-files-btn">刷新列表</button>
+                                        </div>
+                                        <div id="csv-cpa-file-list" style="display:flex;flex-direction:column;gap:8px;max-height:220px;overflow-y:auto;margin-top:10px;border:1px solid var(--border-light);border-radius:var(--radius);padding:10px;">
+                                            <div style="text-align:center;color:var(--text-muted);padding:16px 0;">加载中...</div>
+                                        </div>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label>或上传 CSV 文件</label>
+                                        <input type="file" id="csv-cpa-upload-input" accept=".csv,text/csv" style="display:none;">
+                                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                                            <button type="button" class="btn btn-secondary" id="select-csv-upload-btn">选择 CSV</button>
+                                            <span id="csv-cpa-upload-name" style="font-size:0.9rem;color:var(--text-secondary);">未选择文件</span>
+                                        </div>
+                                        <small style="display:block;margin-top:6px;color:var(--text-muted);font-size:0.75rem;">上传文件优先于目录中选中的文件</small>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label style="display:flex;align-items:center;gap:var(--spacing-sm);cursor:pointer;">
+                                            <input type="checkbox" id="csv-cpa-rotate-proxy" checked>
+                                            <span>每个账号处理前切换一个新 IP</span>
+                                        </label>
+                                    </div>
+                                </div>
 
                                 <div class="form-actions" style="flex-direction: column;">
                                     <button type="submit" class="btn btn-primary btn-lg" id="start-btn" style="width: 100%;">
@@ -439,6 +481,9 @@
                                     </button>
                                     <button type="button" class="btn btn-secondary" id="cancel-btn" disabled style="width: 100%;">
                                         取消任务
+                                    </button>
+                                    <button type="button" class="btn btn-secondary" id="csv-cpa-download-btn" disabled style="display:none;width: 100%;">
+                                        保存 CPA 文件
                                     </button>
                                 </div>
                             </form>

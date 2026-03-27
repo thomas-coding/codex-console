@@ -11,11 +11,12 @@ import logging
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ...database.models import Account
 from ..openai.token_refresh import TokenRefreshManager
 from ...core.register import RegistrationEngine
+from ..proxy_runtime import prepare_runtime_proxy
 from ...services.outlook.service import OutlookService
 
 
@@ -160,12 +161,50 @@ def csv_records_to_cpa_payloads(records: Iterable[CsvAccountRecord]) -> List[dic
 def refresh_csv_records_for_cpa(
     records: Iterable[CsvAccountRecord],
     proxy_url: Optional[str] = None,
+    rotate_proxy_per_record: bool = False,
+    log_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Tuple[List[dict], dict]:
-    manager = TokenRefreshManager(proxy_url=proxy_url)
+    records_list = list(records)
     payloads: List[dict] = []
     details: List[dict] = []
+    total = len(records_list)
 
-    for record in records:
+    def emit_log(message: str):
+        if log_callback:
+            log_callback(message)
+        else:
+            logger.info(message)
+
+    def emit_progress(current_email: str = "", current_step: str = ""):
+        if progress_callback:
+            progress_callback({
+                "total": total,
+                "completed": len(details),
+                "success": sum(1 for item in details if item["success"]),
+                "failed": sum(1 for item in details if not item["success"]),
+                "current_email": current_email,
+                "current_step": current_step,
+            })
+
+    emit_progress()
+
+    for index, record in enumerate(records_list, start=1):
+        if should_cancel and should_cancel():
+            emit_log("[取消] CSV->CPA 处理已收到取消请求，停止继续处理")
+            break
+
+        record_proxy = proxy_url
+        session_id = None
+        if rotate_proxy_per_record:
+            record_proxy, session_id = prepare_runtime_proxy(proxy_url)
+
+        if session_id:
+            emit_log(f"[代理] ({index}/{total}) {record.email} 切换 IPRoyal 会话: {session_id}")
+        emit_log(f"[处理] ({index}/{total}) 开始处理 {record.email}")
+
+        manager = TokenRefreshManager(proxy_url=record_proxy)
         account = Account(
             email=record.email,
             password=record.password or None,
@@ -185,6 +224,7 @@ def refresh_csv_records_for_cpa(
         relogin_error = ""
 
         if account.session_token or account.refresh_token:
+            emit_log(f"[刷新] {record.email} 尝试刷新 token")
             refreshed = manager.refresh_account(account)
             if refreshed.success:
                 account.access_token = refreshed.access_token or account.access_token
@@ -194,9 +234,11 @@ def refresh_csv_records_for_cpa(
                     account.expires_at = refreshed.expires_at
                 account.last_refresh = datetime.utcnow()
                 step = "refreshed"
+                emit_log(f"[刷新] {record.email} token 刷新成功")
             else:
                 refresh_error = refreshed.error_message
                 step = "refresh_failed"
+                emit_log(f"[刷新] {record.email} token 刷新失败: {refresh_error or '未知错误'}")
 
         access_token = str(account.access_token or "").strip()
         is_valid = False
@@ -204,14 +246,21 @@ def refresh_csv_records_for_cpa(
         if not access_token:
             validate_error = refresh_error or "缺少可用 access_token"
         else:
+            emit_log(f"[校验] {record.email} 校验 access_token")
             is_valid, validate_error = manager.validate_token(access_token)
 
         if (not is_valid) and _can_relogin_with_outlook(record):
-            relogin_account = _relogin_csv_record_by_outlook(record, proxy_url=proxy_url)
+            emit_log(f"[重登] {record.email} 尝试使用 Outlook 凭据重新登录")
+            relogin_account = _relogin_csv_record_by_outlook(
+                record,
+                proxy_url=record_proxy,
+                log_callback=log_callback,
+            )
             if relogin_account:
                 account = relogin_account
                 access_token = str(account.access_token or "").strip()
                 if access_token:
+                    emit_log(f"[校验] {record.email} 校验重登录后 access_token")
                     is_valid, validate_error = manager.validate_token(access_token)
                 else:
                     is_valid, validate_error = False, "重登录成功但未获取到 access_token"
@@ -230,6 +279,8 @@ def refresh_csv_records_for_cpa(
                 "has_refresh_token": bool(record.refresh_token),
                 "has_outlook_password": bool(record.outlook_password),
             })
+            emit_log(f"[失败] {record.email}: {relogin_error or validate_error or refresh_error or 'access_token 验证失败'}")
+            emit_progress(record.email, step)
             continue
 
         payloads.append(
@@ -252,12 +303,15 @@ def refresh_csv_records_for_cpa(
             "has_refresh_token": bool(record.refresh_token),
             "has_outlook_password": bool(record.outlook_password),
         })
+        emit_log(f"[成功] {record.email}: {step}")
+        emit_progress(record.email, step)
 
     report = {
         "total": len(details),
         "success_count": sum(1 for item in details if item["success"]),
         "failed_count": sum(1 for item in details if not item["success"]),
         "details": details,
+        "cancelled": bool(should_cancel and should_cancel()),
     }
     return payloads, report
 
@@ -274,6 +328,7 @@ def _can_relogin_with_outlook(record: CsvAccountRecord) -> bool:
 def _relogin_csv_record_by_outlook(
     record: CsvAccountRecord,
     proxy_url: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> Optional[Account]:
     mailbox_email = str(record.outlook_email or record.email or "").strip()
     mailbox_password = str(record.outlook_password or "").strip()
@@ -290,10 +345,17 @@ def _relogin_csv_record_by_outlook(
         mailbox_config["refresh_token"] = record.outlook_refresh_token
 
     email_service = OutlookService(mailbox_config, name=f"csv_relogin_{mailbox_email}")
+
+    def engine_logger(message: str):
+        if log_callback:
+            log_callback(f"[重登] {message}")
+        else:
+            logger.info("CSV Outlook 重登录: %s", message)
+
     engine = RegistrationEngine(
         email_service=email_service,
         proxy_url=proxy_url,
-        callback_logger=lambda msg: logger.info("CSV Outlook 重登录: %s", msg),
+        callback_logger=engine_logger,
         task_uuid=None,
     )
     engine.password = openai_password

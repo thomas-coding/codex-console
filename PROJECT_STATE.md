@@ -7,7 +7,6 @@
 ## Current Status
 
 - Branch: `develop`
-- Last custom commit: `fda1321 feat: add csv account recovery export flow`
 - Upstream sync point on `main`: `8712237`
 - Working tree expectation: code/docs clean; local `csv/`, `csvoutput/`, `data/`, `logs/` are ignored and may exist.
 - Focus area: registration/login resilience, CSV account recovery, repository maintenance docs.
@@ -19,6 +18,8 @@
 - Stored Outlook recovery credentials into `accounts.extra_data.outlook_recovery` so CSV export still works after mailbox-service deletion.
 - Added Web UI support for CSV-to-CPA export from file list or upload.
 - Added registration-time IPRoyal sticky-session rewriting so each registration task gets a fresh proxy session/IP while keeping a stable IP inside the task.
+- Added registration-page CSV-to-CPA background task mode with live monitor, completion download, and per-record proxy session rotation.
+- Added registration-time public-IP probing through the active proxy and same-IP retry logic so consecutive registration tasks try to avoid reusing the previous task's real exit IP.
 - Confirmed Outlook batch registration can run sequentially with `skip_registered=true`, consuming one Outlook mailbox per task without reusing already-registered mailboxes.
 - Separated repository workflow:
   `main` for upstream sync, `develop` for fork-specific work.
@@ -42,10 +43,13 @@
 - `agent.md`
 - `MAINTENANCE.md`
 - `ARCHITECTURE.md`
+- `src/core/proxy_runtime.py`
 - `src/web/routes/registration.py`
 - `src/core/upload/csv_cpa.py`
 - `src/core/register.py`
 - `src/web/routes/accounts.py`
+- `static/js/app.js`
+- `templates/index.html`
 
 ## Notes
 

@@ -6,13 +6,14 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 import zipfile
 import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Body, File, UploadFile
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Body, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -31,6 +32,7 @@ from ...core.dynamic_proxy import get_proxy_url_for_task
 from ...database import crud
 from ...database.models import Account, EmailService as EmailServiceModel
 from ...database.session import get_db
+from ..task_manager import task_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -50,6 +52,11 @@ CSV_DIR_CANDIDATES = (
     Path.cwd() / "csv",
     Path(__file__).resolve().parents[3] / "csv",
 )
+CSV_CPA_EXPORT_DIR_CANDIDATES = (
+    Path.cwd() / "data" / "cpa_exports",
+    Path(__file__).resolve().parents[3] / "data" / "cpa_exports",
+)
+csv_cpa_tasks: Dict[str, Dict[str, Any]] = {}
 
 
 def _get_proxy(request_proxy: Optional[str] = None) -> Optional[str]:
@@ -95,6 +102,12 @@ def _resolve_csv_file(filename: str) -> Path:
     if candidate.suffix.lower() != ".csv":
         raise HTTPException(status_code=400, detail="仅支持 .csv 文件")
     return candidate
+
+
+def _resolve_csv_cpa_export_dir() -> Path:
+    export_dir = CSV_CPA_EXPORT_DIR_CANDIDATES[0]
+    export_dir.mkdir(parents=True, exist_ok=True)
+    return export_dir
 
 
 def _build_cpa_stream_response(payloads: List[dict], report: Optional[dict] = None) -> StreamingResponse:
@@ -1566,6 +1579,234 @@ class CsvFileExportRequest(BaseModel):
     filename: str
 
 
+class CsvCpaTaskCreateRequest(BaseModel):
+    """创建 CSV->CPA 任务请求"""
+    filename: str
+    rotate_proxy_per_record: bool = True
+
+
+def _parse_csv_records_or_raise(content: bytes) -> List[Any]:
+    try:
+        records = parse_csv_accounts(content)
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 编码不支持: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 解析失败: {exc}") from exc
+
+    if not records:
+        raise HTTPException(status_code=400, detail="CSV 中没有可导出的账号记录")
+    return records
+
+
+def _init_csv_cpa_task(batch_id: str, total: int, source_name: str, rotate_proxy_per_record: bool):
+    task_manager.init_batch(batch_id, total)
+    task_manager.update_batch_status(
+        batch_id,
+        task_kind="csv_cpa",
+        source_name=source_name,
+        rotate_proxy_per_record=rotate_proxy_per_record,
+        download_ready=False,
+        filename="",
+    )
+    csv_cpa_tasks[batch_id] = {
+        "batch_id": batch_id,
+        "source_name": source_name,
+        "total": total,
+        "rotate_proxy_per_record": rotate_proxy_per_record,
+        "download_ready": False,
+        "filename": "",
+        "media_type": "",
+        "output_path": "",
+        "report": None,
+        "finished": False,
+    }
+
+
+def _store_csv_cpa_export_file(batch_id: str, filename: str, content: bytes, media_type: str) -> Path:
+    export_dir = _resolve_csv_cpa_export_dir()
+    safe_name = Path(filename).name
+    output_path = export_dir / f"{batch_id}_{safe_name}"
+    output_path.write_bytes(content)
+    return output_path
+
+
+def _run_sync_csv_cpa_export_task(
+    batch_id: str,
+    records: List[Any],
+    proxy: Optional[str],
+    rotate_proxy_per_record: bool,
+):
+    total = len(records)
+
+    def add_batch_log(message: str):
+        task_manager.add_batch_log(batch_id, message)
+
+    def update_progress(payload: dict):
+        task_manager.update_batch_status(
+            batch_id,
+            total=payload.get("total", total),
+            completed=payload.get("completed", 0),
+            success=payload.get("success", 0),
+            failed=payload.get("failed", 0),
+            current_index=payload.get("completed", 0),
+            current_email=payload.get("current_email", ""),
+            current_step=payload.get("current_step", ""),
+        )
+
+    try:
+        add_batch_log(f"[系统] CSV->CPA 任务启动，共 {total} 条记录")
+        payloads, report = refresh_csv_records_for_cpa(
+            records,
+            proxy_url=proxy,
+            rotate_proxy_per_record=rotate_proxy_per_record,
+            log_callback=add_batch_log,
+            progress_callback=update_progress,
+            should_cancel=lambda: task_manager.is_batch_cancelled(batch_id),
+        )
+
+        task = csv_cpa_tasks.get(batch_id)
+        if task is not None:
+            task["report"] = report
+
+        if task_manager.is_batch_cancelled(batch_id):
+            add_batch_log("[取消] CSV->CPA 任务已取消")
+            if task is not None:
+                task["finished"] = True
+            task_manager.update_batch_status(
+                batch_id,
+                finished=True,
+                status="cancelled",
+                completed=report.get("total", 0),
+                success=report.get("success_count", 0),
+                failed=report.get("failed_count", 0),
+            )
+            return
+
+        download_ready = False
+        filename = ""
+        media_type = ""
+
+        if payloads:
+            export_filename, export_content, export_media_type = build_cpa_export_content(payloads, report=report)
+            output_path = _store_csv_cpa_export_file(batch_id, export_filename, export_content, export_media_type)
+            download_ready = True
+            filename = export_filename
+            media_type = export_media_type
+
+            if task is not None:
+                task.update({
+                    "download_ready": True,
+                    "filename": export_filename,
+                    "media_type": export_media_type,
+                    "output_path": str(output_path),
+                })
+            add_batch_log(f"[完成] 处理完成，可保存文件: {export_filename}")
+        else:
+            add_batch_log("[完成] 全部账号已处理，但没有生成可导出的 CPA 文件")
+
+        if task is not None:
+            task["finished"] = True
+
+        task_manager.update_batch_status(
+            batch_id,
+            finished=True,
+            status="completed",
+            total=report.get("total", total),
+            completed=report.get("total", 0),
+            success=report.get("success_count", 0),
+            failed=report.get("failed_count", 0),
+            download_ready=download_ready,
+            filename=filename,
+            media_type=media_type,
+        )
+    except Exception as exc:
+        logger.exception("CSV->CPA 后台任务失败: %s", exc)
+        task = csv_cpa_tasks.get(batch_id)
+        if task is not None:
+            task["finished"] = True
+        add_batch_log(f"[错误] CSV->CPA 任务失败: {exc}")
+        task_manager.update_batch_status(batch_id, finished=True, status="failed")
+
+
+async def run_csv_cpa_export_task(
+    batch_id: str,
+    records: List[Any],
+    proxy: Optional[str],
+    rotate_proxy_per_record: bool,
+):
+    loop = task_manager.get_loop()
+    if loop is None:
+        loop = asyncio.get_running_loop()
+        task_manager.set_loop(loop)
+
+    await loop.run_in_executor(
+        task_manager.executor,
+        _run_sync_csv_cpa_export_task,
+        batch_id,
+        records,
+        proxy,
+        rotate_proxy_per_record,
+    )
+
+
+def _build_csv_cpa_task_response(batch_id: str) -> Dict[str, Any]:
+    task = csv_cpa_tasks.get(batch_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="CSV->CPA 任务不存在")
+
+    status = task_manager.get_batch_status(batch_id) or {}
+    return {
+        "batch_id": batch_id,
+        "task_kind": "csv_cpa",
+        "source_name": task.get("source_name", ""),
+        "rotate_proxy_per_record": task.get("rotate_proxy_per_record", False),
+        "download_ready": task.get("download_ready", False),
+        "filename": task.get("filename", ""),
+        "media_type": task.get("media_type", ""),
+        "total": status.get("total", task.get("total", 0)),
+        "completed": status.get("completed", 0),
+        "success": status.get("success", 0),
+        "failed": status.get("failed", 0),
+        "skipped": status.get("skipped", 0),
+        "current_index": status.get("current_index", 0),
+        "current_email": status.get("current_email", ""),
+        "current_step": status.get("current_step", ""),
+        "status": status.get("status", "running"),
+        "cancelled": status.get("cancelled", False),
+        "finished": status.get("finished", task.get("finished", False)),
+        "logs": task_manager.get_batch_logs(batch_id),
+        "report": task.get("report"),
+    }
+
+
+def _create_csv_cpa_task(
+    *,
+    records: List[Any],
+    source_name: str,
+    rotate_proxy_per_record: bool,
+    background_tasks: BackgroundTasks,
+) -> Dict[str, Any]:
+    batch_id = str(uuid.uuid4())
+    _init_csv_cpa_task(batch_id, len(records), source_name, rotate_proxy_per_record)
+    proxy = _get_proxy()
+    background_tasks.add_task(
+        run_csv_cpa_export_task,
+        batch_id,
+        records,
+        proxy,
+        rotate_proxy_per_record,
+    )
+    return {
+        "batch_id": batch_id,
+        "task_kind": "csv_cpa",
+        "source_name": source_name,
+        "total": len(records),
+        "rotate_proxy_per_record": rotate_proxy_per_record,
+        "download_ready": False,
+        "status": "running",
+    }
+
+
 @router.get("/csv-files")
 async def list_csv_files():
     """列出项目 csv 目录中的账号导出文件"""
@@ -1860,7 +2101,11 @@ async def export_accounts_cpa_from_csv_file(request: CsvFileExportRequest):
         raise HTTPException(status_code=400, detail="CSV 中没有可导出的账号记录")
 
     proxy = _get_proxy()
-    payloads, report = refresh_csv_records_for_cpa(records, proxy_url=proxy)
+    payloads, report = refresh_csv_records_for_cpa(
+        records,
+        proxy_url=proxy,
+        rotate_proxy_per_record=True,
+    )
     if not payloads:
         raise HTTPException(status_code=400, detail=report)
     return _build_cpa_stream_response(payloads, report=report)
@@ -1892,10 +2137,98 @@ async def export_accounts_cpa_from_csv_upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="CSV 中没有可导出的账号记录")
 
     proxy = _get_proxy()
-    payloads, report = refresh_csv_records_for_cpa(records, proxy_url=proxy)
+    payloads, report = refresh_csv_records_for_cpa(
+        records,
+        proxy_url=proxy,
+        rotate_proxy_per_record=True,
+    )
     if not payloads:
         raise HTTPException(status_code=400, detail=report)
     return _build_cpa_stream_response(payloads, report=report)
+
+
+@router.post("/export/cpa-from-csv-task-file")
+async def create_accounts_cpa_from_csv_file_task(
+    request: CsvCpaTaskCreateRequest,
+    background_tasks: BackgroundTasks,
+):
+    """将 csv 目录中的账号文件按原刷新链路放入后台任务，完成后再下载 CPA 文件"""
+    csv_path = _resolve_csv_file(request.filename)
+    records = _parse_csv_records_or_raise(csv_path.read_bytes())
+    return _create_csv_cpa_task(
+        records=records,
+        source_name=csv_path.name,
+        rotate_proxy_per_record=request.rotate_proxy_per_record,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/export/cpa-from-csv-task-upload")
+async def create_accounts_cpa_from_csv_upload_task(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    rotate_proxy_per_record: bool = Form(True),
+):
+    """上传 CSV 并放入后台任务，完成后再下载 CPA 文件"""
+    filename = (file.filename or "").strip()
+    if filename and not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="仅支持 .csv 文件")
+
+    try:
+        content = await file.read()
+    finally:
+        await file.close()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="上传的 CSV 文件为空")
+
+    records = _parse_csv_records_or_raise(content)
+    return _create_csv_cpa_task(
+        records=records,
+        source_name=filename or "uploaded.csv",
+        rotate_proxy_per_record=rotate_proxy_per_record,
+        background_tasks=background_tasks,
+    )
+
+
+@router.get("/export/cpa-task/{batch_id}")
+async def get_accounts_cpa_task_status(batch_id: str):
+    """获取 CSV->CPA 后台任务状态"""
+    return _build_csv_cpa_task_response(batch_id)
+
+
+@router.post("/export/cpa-task/{batch_id}/cancel")
+async def cancel_accounts_cpa_task(batch_id: str):
+    """取消 CSV->CPA 后台任务"""
+    if batch_id not in csv_cpa_tasks:
+        raise HTTPException(status_code=404, detail="CSV->CPA 任务不存在")
+
+    status = task_manager.get_batch_status(batch_id) or {}
+    if status.get("finished"):
+        raise HTTPException(status_code=400, detail="CSV->CPA 任务已完成")
+
+    task_manager.cancel_batch(batch_id)
+    return {"success": True, "message": "CSV->CPA 任务取消请求已提交"}
+
+
+@router.get("/export/cpa-task/{batch_id}/download")
+async def download_accounts_cpa_task_result(batch_id: str):
+    """下载 CSV->CPA 后台任务结果文件"""
+    task = csv_cpa_tasks.get(batch_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="CSV->CPA 任务不存在")
+    if not task.get("download_ready"):
+        raise HTTPException(status_code=400, detail="结果文件尚未生成")
+
+    output_path = Path(str(task.get("output_path") or "")).resolve()
+    if not output_path.is_file():
+        raise HTTPException(status_code=404, detail="结果文件不存在")
+
+    return StreamingResponse(
+        io.BytesIO(output_path.read_bytes()),
+        media_type=task.get("media_type") or "application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={task.get('filename') or output_path.name}"},
+    )
 
 
 @router.get("/stats/summary")

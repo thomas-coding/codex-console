@@ -9,6 +9,7 @@
 - Main modules:
   - `src/core/register.py`: registration/login engine, OTP flow, OAuth callback handling.
   - `src/core/openai/`: OAuth helpers, token refresh, overview fetching.
+  - `src/core/proxy_runtime.py`: runtime proxy rewriting helpers for sticky-session providers such as IPRoyal.
   - `src/core/upload/`: export/upload adapters, including CPA and CSV-to-CPA logic.
   - `src/services/`: mailbox integrations, especially Outlook providers and OTP polling.
   - `src/web/routes/`: account, registration, email, payment, settings, upload APIs.
@@ -22,13 +23,14 @@
 
 - Registration/login:
   - Web route starts task.
-  - Registration route resolves the proxy once per task and rewrites IPRoyal sticky-session credentials at runtime so each task gets a fresh sticky IP while the task itself stays on one IP.
+  - Registration route resolves the proxy once per task, rewrites IPRoyal sticky-session credentials at runtime, probes the real public IP through `ipify`, and retries with a fresh session when the resolved IP matches the previous registration task's IP.
   - `RegistrationEngine` drives email creation, OTP, login fallback, OAuth callback, token/session capture.
   - Result persists to `accounts`.
 - Account export:
   - `src/web/routes/accounts.py` builds JSON/CSV export formats from DB records.
 - CSV to CPA:
   - `src/core/upload/csv_cpa.py` parses CSV rows, tries token refresh, validates access token, and falls back to Outlook relogin when CSV contains full recovery material.
+  - The registration page can also launch CSV-to-CPA as a background batch task and reuse the same WebSocket/monitor console pattern as registration batches.
 
 ## Data Model Notes
 
@@ -56,7 +58,9 @@
 - `main` mirrors upstream state; custom work lands on `develop`.
 - Outlook recovery data is duplicated into account records to survive later mailbox deletion.
 - CSV-to-CPA is not a raw format conversion; it is a token-recovery flow that may refresh or relogin before emitting CPA JSON.
-- IPRoyal proxy records in DB are treated as templates for registration; task startup may rewrite `_session-...` on the fly, but the stored proxy record is not mutated.
+- IPRoyal proxy records in DB are treated as templates; runtime task startup may rewrite `_session-...` on the fly, but the stored proxy record is not mutated.
+- Runtime session rewriting currently applies to registration tasks and CSV-to-CPA per-record recovery tasks.
+- Real public-IP probing and same-IP retry currently apply only to registration tasks; CSV-to-CPA currently rotates session per record but does not verify the actual exit IP.
 - Outlook batch registration should use `concurrency=1` when the goal is "one mailbox, one fresh IP, then next mailbox".
 
 ## Known Risks

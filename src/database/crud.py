@@ -2,12 +2,35 @@
 数据库 CRUD 操作
 """
 
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, desc, asc, func
 
-from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
+from .models import Account, EmailService, RegisteredEmail, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
+
+
+REGISTERED_EMAIL_STATUSES = {
+    "registered_success",
+    "registered_exists_remote",
+}
+
+
+def _normalize_email_key(email: str) -> str:
+    return str(email or "").strip().lower()
+
+
+def _account_implies_registered_email_status(account: Account) -> Optional[str]:
+    if not account:
+        return None
+
+    extra_data = account.extra_data or {}
+    reason = str(extra_data.get("register_failed_reason") or "").strip().lower()
+    if account.status == "failed":
+        if reason == "email_already_registered_on_openai":
+            return "registered_exists_remote"
+        return None
+    return "registered_success"
 
 
 # ============================================================================
@@ -152,6 +175,103 @@ def get_accounts_count(
         query = query.filter(Account.status == status)
 
     return query.scalar()
+
+
+def get_registered_email_by_email(db: Session, email: str) -> Optional[RegisteredEmail]:
+    """根据邮箱获取邮箱注册历史记录"""
+    normalized = _normalize_email_key(email)
+    if not normalized:
+        return None
+    return db.query(RegisteredEmail).filter(RegisteredEmail.email == normalized).first()
+
+
+def upsert_registered_email(
+    db: Session,
+    *,
+    email: str,
+    provider_type: str,
+    status: str,
+    email_service_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    source_task_uuid: Optional[str] = None,
+    note: Optional[str] = None,
+) -> Optional[RegisteredEmail]:
+    """创建或更新邮箱注册历史记录"""
+    normalized = _normalize_email_key(email)
+    provider = str(provider_type or "").strip() or "unknown"
+    normalized_status = str(status or "").strip() or "registered_success"
+    if not normalized:
+        return None
+
+    record = get_registered_email_by_email(db, normalized)
+    now = datetime.utcnow()
+
+    if record is None:
+        record = RegisteredEmail(
+            email=normalized,
+            email_service_id=email_service_id,
+            provider_type=provider,
+            status=normalized_status,
+            account_id=account_id,
+            source_task_uuid=source_task_uuid,
+            note=note,
+            first_registered_at=now,
+            last_seen_at=now,
+        )
+        db.add(record)
+    else:
+        if normalized_status == "registered_success" or record.status != "registered_success":
+            record.status = normalized_status
+        if email_service_id is not None:
+            record.email_service_id = email_service_id
+        if account_id is not None:
+            record.account_id = account_id
+        if source_task_uuid:
+            record.source_task_uuid = source_task_uuid
+        if note is not None:
+            record.note = note
+        if provider and (not record.provider_type or record.provider_type == "unknown"):
+            record.provider_type = provider
+        record.last_seen_at = now
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def get_registered_email_state(
+    db: Session,
+    email: str,
+) -> Tuple[bool, Optional[RegisteredEmail], Optional[Account]]:
+    """
+    获取邮箱是否应被视为“已注册/应跳过”的状态。
+
+    优先读取独立邮箱注册历史表；旧数据则兼容回落到 accounts 表并懒同步。
+    """
+    normalized = _normalize_email_key(email)
+    if not normalized:
+        return False, None, None
+
+    record = get_registered_email_by_email(db, normalized)
+    account = get_account_by_email(db, normalized)
+
+    if record and record.status in REGISTERED_EMAIL_STATUSES:
+        return True, record, account
+
+    derived_status = _account_implies_registered_email_status(account) if account else None
+    if derived_status:
+        record = upsert_registered_email(
+            db,
+            email=normalized,
+            provider_type=getattr(account, "email_service", "") or "unknown",
+            status=derived_status,
+            email_service_id=int(account.email_service_id) if str(account.email_service_id or "").isdigit() else None,
+            account_id=account.id,
+            note="backfilled_from_accounts",
+        )
+        return True, record, account
+
+    return False, record, account
 
 
 # ============================================================================

@@ -64,8 +64,10 @@ git push origin develop
 - CSV-to-CPA export and relogin recovery flow.
 - Registration-page CSV-to-CPA monitored background export with per-record proxy rotation.
 - Outlook recovery metadata duplicated into account records.
+- Independent `registered_emails` history table plus startup backfill, so batch Outlook registration skips mailboxes that were previously registered even if the related account row was later deleted.
 - Registration-time IPRoyal sticky-session rotation for one-task-one-IP behavior.
 - Registration-time real public-IP logging and same-IP retry against the previous registration task.
+- Opt-in browser-profile switch for registration only, affecting registration HTTP headers and Sentinel payload while preserving original behavior when disabled.
 - Agent/architecture/state/maintenance knowledge base.
 
 ## Proxy Notes

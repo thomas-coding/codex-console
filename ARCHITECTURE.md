@@ -35,6 +35,7 @@
 ## Data Model Notes
 
 - `accounts` is the main account table.
+- `registered_emails` is the durable mailbox registration-history table; batch Outlook selection should use it to decide whether a mailbox must be skipped, instead of relying only on `accounts`.
 - Sensitive recovery details for Outlook are now duplicated into `accounts.extra_data.outlook_recovery`.
 - `email_services` stores configured mailbox providers, but CSV export should not depend on those records remaining present for already-registered Outlook accounts.
 
@@ -62,6 +63,7 @@
 - Runtime session rewriting currently applies to registration tasks and CSV-to-CPA per-record recovery tasks.
 - Real public-IP probing and same-IP retry currently apply only to registration tasks; CSV-to-CPA currently rotates session per record but does not verify the actual exit IP.
 - Outlook batch registration should use `concurrency=1` when the goal is "one mailbox, one fresh IP, then next mailbox".
+- Browser-profile simulation is currently opt-in and registration-only, controlled by `registration.browser_profile_enabled`; it affects registration HTTP/Sentinel parameters only and is designed to fall back cleanly when disabled.
 
 ## Known Risks
 

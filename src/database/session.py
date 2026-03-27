@@ -131,6 +131,68 @@ class DatabaseSessionManager:
             except Exception as e:
                 logger.warning(f"迁移 custom_domain -> moe_mail 时出错: {e}")
 
+            try:
+                registered_table_sql = conn.execute(text(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='registered_emails'"
+                )).scalar()
+                if registered_table_sql and "REFERENCES" in str(registered_table_sql).upper():
+                    logger.info("registered_emails 表包含外键约束，重建为独立历史表")
+                    conn.execute(text("ALTER TABLE registered_emails RENAME TO registered_emails_old"))
+                    conn.execute(text("""
+                        CREATE TABLE registered_emails (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            email VARCHAR(255) NOT NULL UNIQUE,
+                            email_service_id INTEGER,
+                            provider_type VARCHAR(50) NOT NULL,
+                            status VARCHAR(50) NOT NULL DEFAULT 'registered_success',
+                            account_id INTEGER,
+                            source_task_uuid VARCHAR(36),
+                            note TEXT,
+                            first_registered_at DATETIME,
+                            last_seen_at DATETIME,
+                            created_at DATETIME,
+                            updated_at DATETIME
+                        )
+                    """))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_registered_emails_email ON registered_emails (email)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_registered_emails_email_service_id ON registered_emails (email_service_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_registered_emails_account_id ON registered_emails (account_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_registered_emails_source_task_uuid ON registered_emails (source_task_uuid)"))
+                    conn.execute(text("""
+                        INSERT OR IGNORE INTO registered_emails (
+                            id,
+                            email,
+                            email_service_id,
+                            provider_type,
+                            status,
+                            account_id,
+                            source_task_uuid,
+                            note,
+                            first_registered_at,
+                            last_seen_at,
+                            created_at,
+                            updated_at
+                        )
+                        SELECT
+                            id,
+                            email,
+                            email_service_id,
+                            provider_type,
+                            status,
+                            account_id,
+                            source_task_uuid,
+                            note,
+                            first_registered_at,
+                            last_seen_at,
+                            created_at,
+                            updated_at
+                        FROM registered_emails_old
+                    """))
+                    conn.execute(text("DROP TABLE registered_emails_old"))
+                    conn.commit()
+            except Exception as e:
+                logger.warning(f"重建 registered_emails 独立表时出错: {e}")
+
             for table_name, column_name, column_type in migrations:
                 try:
                     # 检查列是否存在
@@ -147,6 +209,52 @@ class DatabaseSessionManager:
                         logger.info(f"成功添加列 {table_name}.{column_name}")
                 except Exception as e:
                     logger.warning(f"迁移列 {table_name}.{column_name} 时出错: {e}")
+
+            try:
+                conn.execute(text("""
+                    INSERT OR IGNORE INTO registered_emails (
+                        email,
+                        email_service_id,
+                        provider_type,
+                        status,
+                        account_id,
+                        note,
+                        first_registered_at,
+                        last_seen_at,
+                        created_at,
+                        updated_at
+                    )
+                    SELECT
+                        lower(trim(a.email)) AS email,
+                        CASE
+                            WHEN trim(COALESCE(a.email_service_id, '')) <> ''
+                                 AND trim(a.email_service_id) NOT GLOB '*[^0-9]*'
+                            THEN CAST(a.email_service_id AS INTEGER)
+                            ELSE NULL
+                        END AS email_service_id,
+                        COALESCE(NULLIF(trim(a.email_service), ''), 'unknown') AS provider_type,
+                        CASE
+                            WHEN a.status = 'failed'
+                                 AND COALESCE(a.extra_data, '') LIKE '%email_already_registered_on_openai%'
+                            THEN 'registered_exists_remote'
+                            ELSE 'registered_success'
+                        END AS status,
+                        a.id AS account_id,
+                        'backfilled_from_accounts' AS note,
+                        COALESCE(a.registered_at, a.created_at, CURRENT_TIMESTAMP) AS first_registered_at,
+                        COALESCE(a.updated_at, a.created_at, a.registered_at, CURRENT_TIMESTAMP) AS last_seen_at,
+                        COALESCE(a.created_at, a.registered_at, CURRENT_TIMESTAMP) AS created_at,
+                        COALESCE(a.updated_at, a.created_at, a.registered_at, CURRENT_TIMESTAMP) AS updated_at
+                    FROM accounts a
+                    WHERE trim(COALESCE(a.email, '')) <> ''
+                      AND (
+                            COALESCE(a.status, '') <> 'failed'
+                         OR COALESCE(a.extra_data, '') LIKE '%email_already_registered_on_openai%'
+                      )
+                """))
+                conn.commit()
+            except Exception as e:
+                logger.warning(f"回填 registered_emails 时出错: {e}")
 
 
 # 全局数据库会话管理器实例

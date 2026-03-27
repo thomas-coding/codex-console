@@ -100,6 +100,24 @@ class EmailService(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class RegisteredEmail(Base):
+    """邮箱注册历史表"""
+    __tablename__ = 'registered_emails'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    email_service_id = Column(Integer, index=True)
+    provider_type = Column(String(50), nullable=False)
+    status = Column(String(50), nullable=False, default='registered_success')
+    account_id = Column(Integer, index=True)
+    source_task_uuid = Column(String(36), index=True)
+    note = Column(Text)
+    first_registered_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class RegistrationTask(Base):
     """注册任务表"""
     __tablename__ = 'registration_tasks'

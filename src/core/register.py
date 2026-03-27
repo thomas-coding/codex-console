@@ -17,6 +17,7 @@ from datetime import datetime
 from curl_cffi import requests as cffi_requests
 
 from .openai.oauth import OAuthManager, OAuthStart
+from .browser_profile import BrowserProfile
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
@@ -97,7 +98,8 @@ class RegistrationEngine:
         email_service: BaseEmailService,
         proxy_url: Optional[str] = None,
         callback_logger: Optional[Callable[[str], None]] = None,
-        task_uuid: Optional[str] = None
+        task_uuid: Optional[str] = None,
+        browser_profile: Optional[BrowserProfile] = None,
     ):
         """
         初始化注册引擎
@@ -107,14 +109,16 @@ class RegistrationEngine:
             proxy_url: 代理 URL
             callback_logger: 日志回调函数
             task_uuid: 任务 UUID（用于数据库记录）
+            browser_profile: 可选的统一浏览器画像；未提供时回退原有逻辑
         """
         self.email_service = email_service
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
+        self.browser_profile = browser_profile
 
         # 创建 HTTP 客户端
-        self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
+        self.http_client = OpenAIHTTPClient(proxy_url=proxy_url, browser_profile=browser_profile)
 
         # 创建 OAuth 管理器
         settings = get_settings()
@@ -2114,23 +2118,19 @@ class RegistrationEngine:
             return False, None
 
     def _mark_email_as_registered(self):
-        """标记邮箱为已注册状态（用于防止重复尝试）"""
+        """标记邮箱为已注册状态（用于后续批量直接跳过）"""
         try:
             with get_db() as db:
-                # 检查是否已存在该邮箱的记录
-                existing = crud.get_account_by_email(db, self.email)
-                if not existing:
-                    # 创建一个失败记录，标记该邮箱已注册过
-                    crud.create_account(
-                        db,
-                        email=self.email,
-                        password="",  # 空密码表示未成功注册
-                        email_service=self.email_service.service_type.value,
-                        email_service_id=self.email_info.get("service_id") if self.email_info else None,
-                        status="failed",
-                        extra_data={"register_failed_reason": "email_already_registered_on_openai"}
-                    )
-                    self._log(f"已在数据库中标记邮箱 {self.email} 为已注册状态")
+                crud.upsert_registered_email(
+                    db,
+                    email=self.email,
+                    provider_type=self.email_service.service_type.value,
+                    status="registered_exists_remote",
+                    email_service_id=self.email_info.get("service_id") if self.email_info else None,
+                    source_task_uuid=self.task_uuid,
+                    note="email_already_registered_on_openai",
+                )
+                self._log(f"已在邮箱注册历史中标记 {self.email} 为已注册状态")
         except Exception as e:
             logger.warning(f"标记邮箱状态失败: {e}")
 
@@ -2871,6 +2871,16 @@ class RegistrationEngine:
                     proxy_used=self.proxy_url,
                     extra_data=extra_data,
                     source=result.source
+                )
+                crud.upsert_registered_email(
+                    db,
+                    email=result.email,
+                    provider_type=self.email_service.service_type.value,
+                    status="registered_success",
+                    email_service_id=self.email_info.get("service_id") if self.email_info else None,
+                    account_id=account.id,
+                    source_task_uuid=self.task_uuid,
+                    note="saved_from_registration_result",
                 )
 
                 self._log(f"账户已存进数据库，落袋为安，ID: {account.id}")

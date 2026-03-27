@@ -14,6 +14,7 @@ from curl_cffi.requests import Session, Response
 
 from ..config.constants import ERROR_MESSAGES
 from ..config.settings import get_settings
+from .browser_profile import BrowserProfile
 from .openai.sentinel import SentinelPOWError, build_sentinel_pow_token
 
 
@@ -237,7 +238,8 @@ class OpenAIHTTPClient(HTTPClient):
     def __init__(
         self,
         proxy_url: Optional[str] = None,
-        config: Optional[RequestConfig] = None
+        config: Optional[RequestConfig] = None,
+        browser_profile: Optional[BrowserProfile] = None,
     ):
         """
         初始化 OpenAI HTTP 客户端
@@ -247,6 +249,7 @@ class OpenAIHTTPClient(HTTPClient):
             config: 请求配置
         """
         super().__init__(proxy_url, config)
+        self.browser_profile = browser_profile
 
         # OpenAI 特定的默认配置
         if config is None:
@@ -254,11 +257,22 @@ class OpenAIHTTPClient(HTTPClient):
             self.config.max_retries = 3
 
         # 默认请求头
+        user_agent = (
+            browser_profile.user_agent
+            if browser_profile and browser_profile.user_agent
+            else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        accept_language = (
+            browser_profile.accept_language
+            if browser_profile and browser_profile.accept_language
+            else "en-US,en;q=0.9"
+        )
+
         self.default_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": user_agent,
             "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Language": accept_language,
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Sec-Fetch-Dest": "empty",
@@ -364,7 +378,10 @@ class OpenAIHTTPClient(HTTPClient):
         from ..config.constants import OPENAI_API_ENDPOINTS
 
         try:
-            pow_token = build_sentinel_pow_token(self.default_headers.get("User-Agent", ""))
+            pow_token = build_sentinel_pow_token(
+                self.default_headers.get("User-Agent", ""),
+                browser_profile=self.browser_profile,
+            )
             sen_req_body = json.dumps({
                 "p": pow_token,
                 "id": did,

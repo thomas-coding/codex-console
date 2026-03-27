@@ -19,6 +19,8 @@ Read this file first. Do not scan the whole repository by default.
   Read `PROJECT_STATE.md` then `README.md`.
 - Registration, login, token, Outlook, CSV, CPA tasks:
   Read `PROJECT_STATE.md` then `ARCHITECTURE.md`.
+- Registration hardening, proxy/session/IP rotation, browser-profile switch:
+  Read `ARCHITECTURE.md`, then `src/web/routes/registration.py`, `src/core/proxy_runtime.py`, `src/core/browser_profile.py`, and `src/core/register.py`.
 - Proxy/IP rotation or rate-limit investigations:
   Read `ARCHITECTURE.md`, then `src/core/proxy_runtime.py`, then `src/web/routes/registration.py`.
 - Branch sync, upstream merge, release, commit hygiene:

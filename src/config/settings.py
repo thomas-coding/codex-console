@@ -254,6 +254,12 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.REGISTRATION,
         description="注册入口链路（native=原本链路, abcard=ABCard入口链路；Outlook 邮箱会自动走 Outlook 链路）"
     ),
+    "registration_browser_profile_enabled": SettingDefinition(
+        db_key="registration.browser_profile_enabled",
+        default_value=False,
+        category=SettingCategory.REGISTRATION,
+        description="是否启用统一浏览器画像（关闭时完全走原有请求参数逻辑）"
+    ),
 
     # 邮箱服务配置
     "email_service_priority": SettingDefinition(
@@ -450,6 +456,7 @@ SETTING_TYPES: Dict[str, Type] = {
     "registration_sleep_min": int,
     "registration_sleep_max": int,
     "registration_entry_flow": str,
+    "registration_browser_profile_enabled": bool,
     "email_service_priority": dict,
     "tempmail_enabled": bool,
     "tempmail_timeout": int,
@@ -718,6 +725,7 @@ class Settings(BaseModel):
     registration_sleep_min: int = 5
     registration_sleep_max: int = 30
     registration_entry_flow: str = "native"
+    registration_browser_profile_enabled: bool = False
 
     # 邮箱服务配置
     email_service_priority: Dict[str, int] = {"tempmail": 0, "yyds_mail": 1, "outlook": 2, "moe_mail": 3}

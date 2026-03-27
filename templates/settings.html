@@ -490,6 +490,18 @@
                                 </div>
                             </div>
 
+                            <div class="form-group">
+                                <label style="display:flex; align-items:flex-start; gap:8px;">
+                                    <input type="checkbox" id="registration-browser-profile-enabled" name="browser_profile_enabled" style="margin-top: 4px;">
+                                    <span>
+                                        启用统一浏览器画像
+                                        <span class="hint" style="display:block;">
+                                            仅作用于注册链路的 HTTP Header 与 Sentinel 参数；关闭后完全回到原有逻辑，不影响 CSV、支付和邮箱管理流程
+                                        </span>
+                                    </span>
+                                </label>
+                            </div>
+
                             <div class="form-row">
                                 <div class="form-group">
                                     <label for="sleep-min">最小等待时间 (秒)</label>

@@ -50,6 +50,7 @@ class RegistrationSettings(BaseModel):
     sleep_min: int = 5
     sleep_max: int = 30
     entry_flow: str = "native"
+    browser_profile_enabled: bool = False
 
 
 class WebUISettings(BaseModel):
@@ -98,6 +99,7 @@ async def get_all_settings():
             "sleep_min": settings.registration_sleep_min,
             "sleep_max": settings.registration_sleep_max,
             "entry_flow": entry_flow,
+            "browser_profile_enabled": settings.registration_browser_profile_enabled,
         },
         "webui": {
             "host": settings.webui_host,
@@ -228,6 +230,7 @@ async def get_registration_settings():
         "sleep_min": settings.registration_sleep_min,
         "sleep_max": settings.registration_sleep_max,
         "entry_flow": entry_flow,
+        "browser_profile_enabled": settings.registration_browser_profile_enabled,
     }
 
 
@@ -247,6 +250,7 @@ async def update_registration_settings(request: RegistrationSettings):
         registration_sleep_min=request.sleep_min,
         registration_sleep_max=request.sleep_max,
         registration_entry_flow=flow,
+        registration_browser_profile_enabled=request.browser_profile_enabled,
     )
 
     return {"success": True, "message": "注册设置已更新"}

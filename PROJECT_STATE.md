@@ -20,7 +20,9 @@
 - Added registration-time IPRoyal sticky-session rewriting so each registration task gets a fresh proxy session/IP while keeping a stable IP inside the task.
 - Added registration-page CSV-to-CPA background task mode with live monitor, completion download, and per-record proxy session rotation.
 - Added registration-time public-IP probing through the active proxy and same-IP retry logic so consecutive registration tasks try to avoid reusing the previous task's real exit IP.
+- Added independent `registered_emails` history so Outlook mailboxes that have ever registered or been confirmed as pre-existing can be skipped even if the related `accounts` row is later deleted.
 - Confirmed Outlook batch registration can run sequentially with `skip_registered=true`, consuming one Outlook mailbox per task without reusing already-registered mailboxes.
+- Added opt-in `registration_browser_profile_enabled` switch for registration only; when enabled it injects a lightweight browser profile into registration HTTP headers and Sentinel payload, and when disabled it stays on the original code path.
 - Separated repository workflow:
   `main` for upstream sync, `develop` for fork-specific work.
 
@@ -44,9 +46,12 @@
 - `MAINTENANCE.md`
 - `ARCHITECTURE.md`
 - `src/core/proxy_runtime.py`
+- `src/core/browser_profile.py`
 - `src/web/routes/registration.py`
 - `src/core/upload/csv_cpa.py`
 - `src/core/register.py`
+- `src/database/crud.py`
+- `src/database/session.py`
 - `src/web/routes/accounts.py`
 - `static/js/app.js`
 - `templates/index.html`

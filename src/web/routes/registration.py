@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
+from ...core.browser_profile import build_browser_profile
 from ...core.http_client import HTTPClient, RequestConfig
 from ...core.register import RegistrationEngine, RegistrationResult
 from ...core.proxy_runtime import prepare_runtime_proxy
@@ -327,6 +328,24 @@ def _normalize_email_service_config(
     return normalized
 
 
+def _get_outlook_email_registration_state(db, email: str):
+    """查询 Outlook 邮箱是否已被历史注册逻辑占用。"""
+    is_registered, registration_record, existing_account = crud.get_registered_email_state(db, email)
+    return is_registered, registration_record, existing_account
+
+
+def _format_browser_profile_log(profile) -> str:
+    profile_data = profile.to_log_dict()
+    return (
+        f"[系统] 浏览器画像已启用: id={profile_data['profile_id']}, "
+        f"family={profile_data['family']}, "
+        f"ua={profile_data['user_agent']}, "
+        f"lang={profile_data['accept_language']}, "
+        f"tz={profile_data['timezone']}, "
+        f"viewport={profile_data['viewport']}"
+    )
+
+
 def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
     """
     在线程池中执行的同步注册任务
@@ -398,6 +417,15 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             # 创建邮箱服务
             service_type = EmailServiceType(email_service_type)
             settings = get_settings()
+            browser_profile = None
+
+            if bool(getattr(settings, "registration_browser_profile_enabled", False)):
+                browser_profile = build_browser_profile(
+                    proxy_ip=public_ip,
+                    proxy_country="US" if public_ip else None,
+                )
+                logger.info("任务 %s 启用浏览器画像: %s", task_uuid, browser_profile.to_log_dict())
+                _task_proxy_log(_format_browser_profile_log(browser_profile))
 
             # 优先使用数据库中配置的邮箱服务
             if email_service_id:
@@ -460,7 +488,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         raise ValueError("没有可用的自定义域名邮箱服务，请先在设置中配置")
                 elif service_type == EmailServiceType.OUTLOOK:
                     # 检查数据库中是否有可用的 Outlook 账户
-                    from ...database.models import EmailService as EmailServiceModel, Account
+                    from ...database.models import EmailService as EmailServiceModel
                     # 获取所有启用的 Outlook 服务
                     outlook_services = db.query(EmailServiceModel).filter(
                         EmailServiceModel.service_type == "outlook",
@@ -476,9 +504,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         email = svc.config.get("email") if svc.config else None
                         if not email:
                             continue
-                        # 检查是否已在 accounts 表中注册
-                        existing = db.query(Account).filter(Account.email == email).first()
-                        if not existing:
+                        is_registered, _, _ = _get_outlook_email_registration_state(db, email)
+                        if not is_registered:
                             selected_service = svc
                             logger.info(f"选择未注册的 Outlook 账户: {email}")
                             break
@@ -545,7 +572,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 email_service=email_service,
                 proxy_url=actual_proxy_url,
                 callback_logger=log_callback,
-                task_uuid=task_uuid
+                task_uuid=task_uuid,
+                browser_profile=browser_profile,
             )
 
             # 执行注册
@@ -1473,10 +1501,9 @@ async def get_outlook_accounts_for_registration():
     """
     获取可用于注册的 Outlook 账户列表
 
-    返回所有已启用的 Outlook 服务，并检查每个邮箱是否已在 accounts 表中注册
+    返回所有已启用的 Outlook 服务，并检查每个邮箱是否已被邮箱注册历史标记为已注册。
     """
     from ...database.models import EmailService as EmailServiceModel
-    from ...database.models import Account
 
     with get_db() as db:
         # 获取所有启用的 Outlook 服务
@@ -1493,12 +1520,7 @@ async def get_outlook_accounts_for_registration():
             config = service.config or {}
             email = config.get("email") or service.name
 
-            # 检查是否已注册（查询 accounts 表）
-            existing_account = db.query(Account).filter(
-                Account.email == email
-            ).first()
-
-            is_registered = existing_account is not None
+            is_registered, registration_record, existing_account = _get_outlook_email_registration_state(db, email)
             if is_registered:
                 registered_count += 1
             else:
@@ -1510,7 +1532,7 @@ async def get_outlook_accounts_for_registration():
                 name=service.name,
                 has_oauth=bool(config.get("client_id") and config.get("refresh_token")),
                 is_registered=is_registered,
-                registered_account_id=existing_account.id if existing_account else None
+                registered_account_id=existing_account.id if existing_account else (registration_record.account_id if registration_record else None)
             ))
 
         return OutlookAccountsListResponse(
@@ -1597,7 +1619,6 @@ async def start_outlook_batch_registration(
     - interval_max: 最大间隔秒数
     """
     from ...database.models import EmailService as EmailServiceModel
-    from ...database.models import Account
 
     # 验证参数
     if not request.service_ids:
@@ -1630,12 +1651,8 @@ async def start_outlook_batch_registration(
                 config = service.config or {}
                 email = config.get("email") or service.name
 
-                # 检查是否已注册
-                existing_account = db.query(Account).filter(
-                    Account.email == email
-                ).first()
-
-                if existing_account:
+                is_registered, _, _ = _get_outlook_email_registration_state(db, email)
+                if is_registered:
                     skipped_count += 1
                 else:
                     actual_service_ids.append(service_id)

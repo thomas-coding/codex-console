@@ -211,11 +211,14 @@
                             </button>
                             <div class="dropdown-menu" id="export-menu">
                                 <a href="#" class="dropdown-item" data-format="json">导出 JSON</a>
-                                <a href="#" class="dropdown-item" data-format="csv">导出 CSV</a>
+                                <a href="#" class="dropdown-item" data-format="csv">导出完整 CSV</a>
                                 <a href="#" class="dropdown-item" data-format="cpa">导出 CPA 格式</a>
                                 <a href="#" class="dropdown-item" data-format="sub2api">导出 Sub2Api 格式</a>
                             </div>
                         </div>
+                        <button class="btn btn-secondary" id="csv-cpa-btn" title="从 CSV 更新并导出 CPA JSON">
+                            🧾 CSV 转 CPA
+                        </button>
                     </div>
                 </div>
             </div>
@@ -337,6 +340,48 @@
             <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end;">
                 <button class="btn btn-secondary" id="sub2api-use-auto-btn">自动选择</button>
                 <button class="btn btn-secondary" id="cancel-sub2api-modal-btn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="csv-cpa-modal">
+        <div class="modal-content" style="max-width: 720px;">
+            <div class="modal-header">
+                <h3>🧾 CSV 转 CPA</h3>
+                <button class="modal-close" id="close-csv-cpa-modal">&times;</button>
+            </div>
+            <div class="modal-body" style="display: flex; flex-direction: column; gap: 18px;">
+                <section style="display: flex; flex-direction: column; gap: 10px;">
+                    <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap;">
+                        <div>
+                            <div style="font-weight: 600;">项目 `csv/` 目录文件</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted);" id="csv-cpa-directory">加载中...</div>
+                        </div>
+                        <button class="btn btn-ghost btn-sm" id="refresh-csv-files-btn">刷新列表</button>
+                    </div>
+                    <div id="csv-cpa-file-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow-y: auto;">
+                        <div style="text-align: center; color: var(--text-muted); padding: 16px 0;">加载中...</div>
+                    </div>
+                    <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.6;">
+                        导出前会先按现有账号流程尝试刷新并校验 token：优先 `session_token`，其次 `refresh_token`。如果 CSV 里带有完整 Outlook 凭据和 OpenAI 账号密码，刷新失败后还会尝试直接重走“已有账号登录 + 邮箱验证码”链路，再导出可用 CPA。
+                    </div>
+                </section>
+
+                <section style="display: flex; flex-direction: column; gap: 10px; padding-top: 12px; border-top: 1px solid var(--border);">
+                    <div>
+                        <div style="font-weight: 600;">上传本地 CSV</div>
+                        <div style="font-size: 0.85rem; color: var(--text-muted);">支持当前工具导出的完整账号 CSV，上传后会先刷新校验；若 CSV 中包含 Outlook 凭据，还可在 refresh 失败后自动重登再导出。</div>
+                    </div>
+                    <input type="file" id="csv-cpa-upload-input" accept=".csv,text/csv" style="display: none;">
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                        <button class="btn btn-secondary" id="select-csv-upload-btn">选择 CSV 文件</button>
+                        <span id="csv-cpa-upload-name" style="font-size: 0.9rem; color: var(--text-secondary);">未选择文件</span>
+                    </div>
+                </section>
+            </div>
+            <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end;">
+                <button class="btn btn-primary" id="export-uploaded-csv-btn">刷新并导出</button>
+                <button class="btn btn-secondary" id="cancel-csv-cpa-modal-btn">关闭</button>
             </div>
         </div>
     </div>

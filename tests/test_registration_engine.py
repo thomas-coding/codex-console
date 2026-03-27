@@ -1,11 +1,14 @@
 import base64
 import json
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from src.core.register import RegistrationEngine, RegistrationResult
 from src.services.base import BaseEmailService
+from src.services.outlook.service import OutlookService
 
 
 class DummyResponse:
@@ -294,3 +297,121 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_run_switches_to_existing_account_login_when_register_username_is_rejected():
+    session = QueueSession([
+        ("GET", "https://auth.example.test/flow/1", _response_with_did("did-1")),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["PASSWORD_REGISTRATION"]}}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["register"],
+            DummyResponse(
+                status_code=400,
+                payload={
+                    "error": {
+                        "message": "Failed to register username. Please try again.",
+                        "code": "bad_request",
+                    }
+                },
+                text='{"error":{"message":"Failed to register username. Please try again.","code":"bad_request"}}',
+            ),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]}}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["password_verify"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
+        ),
+        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], _response_with_login_cookies("ws-existing", "session-existing")),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-existing"}),
+        ),
+        (
+            "GET",
+            "https://auth.example.test/continue-existing",
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "http://localhost:1455/auth/callback?code=code-1&state=state-1"},
+            ),
+        ),
+    ])
+
+    email_service = FakeEmailService(["135790"])
+    engine = RegistrationEngine(email_service)
+    engine.password = "existing-pass"
+    fake_oauth = FakeOAuthManager()
+    engine.http_client = FakeOpenAIClient([session], ["sentinel-1"])
+    engine.oauth_manager = fake_oauth
+
+    result = engine.run()
+
+    assert result.success is True
+    assert result.source == "login"
+    assert result.password == "existing-pass"
+    assert result.session_token == "session-existing"
+    assert sum(1 for call in session.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 0
+    password_verify_body = json.loads(session.calls[4]["kwargs"]["data"])
+    assert password_verify_body == {"password": "existing-pass"}
+
+
+def test_save_to_database_persists_outlook_recovery_payload(monkeypatch):
+    email_service = OutlookService(
+        {
+            "email": "tester@outlook.com",
+            "password": "mail-pwd",
+            "client_id": "mail-client",
+            "refresh_token": "mail-refresh",
+        },
+        name="test-outlook",
+    )
+    engine = RegistrationEngine(email_service)
+    engine.email_info = {"email": "tester@outlook.com", "service_id": "tester@outlook.com"}
+    engine._dump_session_cookies = lambda: "cookie-1"
+
+    captured = {}
+
+    def fake_create_account(db, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=123)
+
+    @contextmanager
+    def fake_get_db():
+        yield object()
+
+    monkeypatch.setattr("src.core.register.crud.create_account", fake_create_account)
+    monkeypatch.setattr("src.core.register.get_db", fake_get_db)
+    monkeypatch.setattr("src.core.register.get_settings", lambda: SimpleNamespace(openai_client_id="app-client"))
+
+    result = RegistrationResult(
+        success=True,
+        email="tester@outlook.com",
+        password="openai-pass",
+        account_id="acct-1",
+        workspace_id="ws-1",
+        access_token="access-1",
+        refresh_token="refresh-1",
+        id_token="id-1",
+        session_token="session-1",
+        metadata={"foo": "bar"},
+        source="register",
+    )
+
+    assert engine.save_to_database(result) is True
+    assert captured["extra_data"]["foo"] == "bar"
+    assert captured["extra_data"]["outlook_recovery"] == {
+        "email": "tester@outlook.com",
+        "password": "mail-pwd",
+        "client_id": "mail-client",
+        "refresh_token": "mail-refresh",
+    }

@@ -35,6 +35,7 @@ from ..config.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
+ACCOUNT_OUTLOOK_RECOVERY_KEY = "outlook_recovery"
 
 
 @dataclass
@@ -382,6 +383,41 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"创建邮箱失败: {e}", "error")
             return False
+
+    def _build_outlook_recovery_payload(self) -> Dict[str, str]:
+        """提取当前 Outlook 账号的恢复信息，冗余保存到账号表。"""
+        if str(self.email_service.service_type.value or "").strip().lower() != "outlook":
+            return {}
+
+        target_email = str(
+            (self.email_info or {}).get("email") or self.email or ""
+        ).strip().lower()
+        raw_config = getattr(self.email_service, "config", None)
+        config = raw_config if isinstance(raw_config, dict) else {}
+
+        candidates: List[Dict[str, Any]] = []
+        if "email" in config and ("password" in config or "refresh_token" in config):
+            candidates.append(config)
+        for item in config.get("accounts", []) if isinstance(config.get("accounts"), list) else []:
+            if isinstance(item, dict):
+                candidates.append(item)
+
+        selected: Dict[str, Any] = {}
+        for item in candidates:
+            item_email = str(item.get("email") or "").strip().lower()
+            if target_email and item_email == target_email:
+                selected = item
+                break
+        if not selected and len(candidates) == 1:
+            selected = candidates[0]
+
+        payload = {
+            "email": str(selected.get("email") or target_email or "").strip(),
+            "password": str(selected.get("password") or "").strip(),
+            "client_id": str(selected.get("client_id") or "").strip(),
+            "refresh_token": str(selected.get("refresh_token") or "").strip(),
+        }
+        return payload if any(payload.values()) else {}
 
     def _start_oauth(self) -> bool:
         """开始 OAuth 流程"""
@@ -1979,6 +2015,7 @@ class RegistrationEngine:
         """注册密码"""
         try:
             self._last_register_password_error = None
+            existing_password = str(self.password or "").strip()
             # 生成密码
             password = self._generate_password()
             self.password = password  # 保存密码到实例变量
@@ -2034,11 +2071,30 @@ class RegistrationEngine:
                                 ):
                                     self._log("登录入口探测命中：该邮箱大概率已是 OpenAI 账号", "warning")
                                     self._mark_email_as_registered()
-                                    self._last_register_password_error = (
-                                        "该邮箱已存在 OpenAI 账号。"
-                                        "若是刚刚注册中断，请优先使用上一轮任务日志里的“生成密码”走登录续跑；"
-                                        "拿不到旧密码再更换邮箱。"
-                                    )
+                                    if existing_password:
+                                        self.password = existing_password
+                                        self._log("已恢复已有账号密码，准备切换到登录链路继续收尾", "warning")
+                                        if probe.page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                                            self._otp_sent_at = time.time()
+                                            self._is_existing_account = True
+                                        else:
+                                            password_result = self._submit_login_password()
+                                            if password_result.success and password_result.is_existing_account:
+                                                self._is_existing_account = True
+                                            else:
+                                                self._last_register_password_error = (
+                                                    "该邮箱已存在 OpenAI 账号，但旧密码登录失败；"
+                                                    "请检查 CSV 中 OpenAI 账号密码是否正确。"
+                                                )
+
+                                        if self._is_existing_account:
+                                            self._last_register_password_error = ""
+                                            self._log("老账号登录入口已接管，后续继续走登录 OTP 收尾", "warning")
+                                    else:
+                                        self._last_register_password_error = (
+                                            "该邮箱已存在 OpenAI 账号，但当前任务没有旧密码；"
+                                            "请补充 OpenAI 账号密码后再走登录续跑。"
+                                        )
                             except Exception as probe_error:
                                 self._log(f"登录入口探测失败: {probe_error}", "warning")
                     else:
@@ -2692,34 +2748,38 @@ class RegistrationEngine:
                 self._log("5. 设置密码，别让小偷偷笑...")
                 password_ok, _ = self._register_password(did, sen_token)
                 if not password_ok:
-                    result.error_message = self._last_register_password_error or "注册密码失败"
-                    return result
-
-                self._log("6. 催一下注册验证码出门，邮差该冲刺了...")
-                if not self._send_verification_code():
-                    result.error_message = "发送验证码失败"
-                    return result
-
-                self._log("7. 等验证码飞来，邮箱请注意查收...")
-                self._log("8. 对一下验证码，看看是不是本人...")
-                if not self._verify_email_otp_with_retry(stage_label="注册验证码", max_attempts=3):
-                    result.error_message = "验证验证码失败"
-                    return result
-
-                self._log("9. 给账号办个正式户口，名字写档案里...")
-                if not self._create_user_account():
-                    result.error_message = "创建用户账户失败"
-                    return result
-
-                if effective_entry_flow in {"native", "outlook"}:
-                    login_ready, login_error = self._restart_login_flow()
-                    if not login_ready:
-                        result.error_message = login_error
+                    if self._is_existing_account:
+                        self._log("注册密码阶段确认该邮箱已存在，切换到登录链路继续收尾", "warning")
+                    else:
+                        result.error_message = self._last_register_password_error or "注册密码失败"
                         return result
-                    if effective_entry_flow == "outlook":
-                        self._log("注册入口链路: Outlook（迁移版，按朋友版 Outlook 主流程收尾）")
-                else:
-                    self._log("注册入口链路: ABCard（新账号不重登，直接抓取会话）")
+
+                if not self._is_existing_account:
+                    self._log("6. 催一下注册验证码出门，邮差该冲刺了...")
+                    if not self._send_verification_code():
+                        result.error_message = "发送验证码失败"
+                        return result
+
+                    self._log("7. 等验证码飞来，邮箱请注意查收...")
+                    self._log("8. 对一下验证码，看看是不是本人...")
+                    if not self._verify_email_otp_with_retry(stage_label="注册验证码", max_attempts=3):
+                        result.error_message = "验证验证码失败"
+                        return result
+
+                    self._log("9. 给账号办个正式户口，名字写档案里...")
+                    if not self._create_user_account():
+                        result.error_message = "创建用户账户失败"
+                        return result
+
+                    if effective_entry_flow in {"native", "outlook"}:
+                        login_ready, login_error = self._restart_login_flow()
+                        if not login_ready:
+                            result.error_message = login_error
+                            return result
+                        if effective_entry_flow == "outlook":
+                            self._log("注册入口链路: Outlook（迁移版，按朋友版 Outlook 主流程收尾）")
+                    else:
+                        self._log("注册入口链路: ABCard（新账号不重登，直接抓取会话）")
 
             if effective_entry_flow == "native":
                 if not self._complete_token_exchange_native_backup(result):
@@ -2787,6 +2847,10 @@ class RegistrationEngine:
         try:
             # 获取默认 client_id
             settings = get_settings()
+            extra_data = dict(result.metadata or {})
+            recovery_payload = self._build_outlook_recovery_payload()
+            if recovery_payload:
+                extra_data[ACCOUNT_OUTLOOK_RECOVERY_KEY] = recovery_payload
 
             with get_db() as db:
                 # 保存账户信息
@@ -2805,7 +2869,7 @@ class RegistrationEngine:
                     refresh_token=result.refresh_token,
                     id_token=result.id_token,
                     proxy_used=self.proxy_url,
-                    extra_data=result.metadata,
+                    extra_data=extra_data,
                     source=result.source
                 )
 

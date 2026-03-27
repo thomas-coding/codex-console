@@ -14,6 +14,7 @@ from curl_cffi import CurlMime
 from ...database.session import get_db
 from ...database.models import Account
 from ...config.settings import get_settings
+from .csv_cpa import build_cpa_token_payload
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +100,15 @@ def generate_token_json(account: Account) -> dict:
     Returns:
         CPA 格式的 Token 字典
     """
-    return {
-        "type": "codex",
-        "email": account.email,
-        "expired": account.expires_at.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.expires_at else "",
-        "id_token": account.id_token or "",
-        "account_id": account.account_id or "",
-        "access_token": account.access_token or "",
-        "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.last_refresh else "",
-        "refresh_token": account.refresh_token or "",
-    }
+    return build_cpa_token_payload(
+        email=account.email,
+        id_token=account.id_token or "",
+        account_id=account.account_id or "",
+        access_token=account.access_token or "",
+        refresh_token=account.refresh_token or "",
+        expires_at=account.expires_at,
+        last_refresh=account.last_refresh,
+    )
 
 
 def upload_to_cpa(

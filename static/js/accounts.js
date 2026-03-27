@@ -30,13 +30,24 @@ const elements = {
     batchDeleteBtn: document.getElementById('batch-delete-btn'),
     exportBtn: document.getElementById('export-btn'),
     exportMenu: document.getElementById('export-menu'),
+    csvCpaBtn: document.getElementById('csv-cpa-btn'),
     selectAll: document.getElementById('select-all'),
     prevPage: document.getElementById('prev-page'),
     nextPage: document.getElementById('next-page'),
     pageInfo: document.getElementById('page-info'),
     detailModal: document.getElementById('detail-modal'),
     modalBody: document.getElementById('modal-body'),
-    closeModal: document.getElementById('close-modal')
+    closeModal: document.getElementById('close-modal'),
+    csvCpaModal: document.getElementById('csv-cpa-modal'),
+    csvCpaDirectory: document.getElementById('csv-cpa-directory'),
+    csvCpaFileList: document.getElementById('csv-cpa-file-list'),
+    refreshCsvFilesBtn: document.getElementById('refresh-csv-files-btn'),
+    closeCsvCpaModal: document.getElementById('close-csv-cpa-modal'),
+    cancelCsvCpaModalBtn: document.getElementById('cancel-csv-cpa-modal-btn'),
+    csvCpaUploadInput: document.getElementById('csv-cpa-upload-input'),
+    selectCsvUploadBtn: document.getElementById('select-csv-upload-btn'),
+    csvCpaUploadName: document.getElementById('csv-cpa-upload-name'),
+    exportUploadedCsvBtn: document.getElementById('export-uploaded-csv-btn')
 };
 
 // 初始化
@@ -157,6 +168,14 @@ function initEventListeners() {
         elements.exportMenu.classList.remove('active');
     });
 
+    elements.csvCpaBtn.addEventListener('click', openCsvCpaModal);
+    elements.refreshCsvFilesBtn.addEventListener('click', loadCsvDirectoryFiles);
+    elements.closeCsvCpaModal.addEventListener('click', closeCsvCpaModal);
+    elements.cancelCsvCpaModalBtn.addEventListener('click', closeCsvCpaModal);
+    elements.selectCsvUploadBtn.addEventListener('click', () => elements.csvCpaUploadInput.click());
+    elements.csvCpaUploadInput.addEventListener('change', updateSelectedCsvUpload);
+    elements.exportUploadedCsvBtn.addEventListener('click', exportUploadedCsvToCpa);
+
     // 关闭模态框
     elements.closeModal.addEventListener('click', () => {
         elements.detailModal.classList.remove('active');
@@ -165,6 +184,12 @@ function initEventListeners() {
     elements.detailModal.addEventListener('click', (e) => {
         if (e.target === elements.detailModal) {
             elements.detailModal.classList.remove('active');
+        }
+    });
+
+    elements.csvCpaModal.addEventListener('click', (e) => {
+        if (e.target === elements.csvCpaModal) {
+            closeCsvCpaModal();
         }
     });
 
@@ -795,37 +820,153 @@ async function exportAccounts(format) {
             body: JSON.stringify(buildBatchPayload())
         });
 
-        if (!response.ok) {
-            throw new Error(`导出失败: HTTP ${response.status}`);
-        }
-
-        // 获取文件内容
-        const blob = await response.blob();
-
-        // 从 Content-Disposition 获取文件名
-        const disposition = response.headers.get('Content-Disposition');
-        let filename = `accounts_${Date.now()}.${(format === 'cpa' || format === 'sub2api') ? 'json' : (format === 'codex' ? 'jsonl' : format)}`;
-        if (disposition) {
-            const match = disposition.match(/filename=(.+)/);
-            if (match) {
-                filename = match[1];
-            }
-        }
-
-        // 创建下载链接
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        a.remove();
-
+        await downloadResponse(
+            response,
+            `accounts_${Date.now()}.${(format === 'cpa' || format === 'sub2api') ? 'json' : (format === 'codex' ? 'jsonl' : format)}`
+        );
         toast.success('导出成功');
     } catch (error) {
         console.error('导出失败:', error);
         toast.error('导出失败: ' + error.message);
+    }
+}
+
+function extractFilenameFromDisposition(disposition, fallbackName) {
+    if (!disposition) return fallbackName;
+    const match = disposition.match(/filename="?([^"]+)"?/i);
+    return match ? match[1] : fallbackName;
+}
+
+async function downloadResponse(response, fallbackName) {
+    if (!response.ok) {
+        let message = `HTTP ${response.status}`;
+        try {
+            const errorData = await response.json();
+            const detail = errorData.detail || errorData.message || message;
+            message = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
+        } catch (error) {
+            const text = await response.text();
+            if (text) message = text;
+        }
+        throw new Error(message);
+    }
+
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition');
+    const filename = extractFilenameFromDisposition(disposition, fallbackName);
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+}
+
+function closeCsvCpaModal() {
+    elements.csvCpaModal.classList.remove('active');
+}
+
+async function openCsvCpaModal() {
+    elements.csvCpaModal.classList.add('active');
+    await loadCsvDirectoryFiles();
+}
+
+async function loadCsvDirectoryFiles() {
+    elements.csvCpaDirectory.textContent = '加载中...';
+    elements.csvCpaFileList.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:16px 0;">加载中...</div>';
+
+    try {
+        const data = await api.get('/accounts/csv-files');
+        elements.csvCpaDirectory.textContent = data.directory || 'csv';
+
+        if (!data.files || data.files.length === 0) {
+            elements.csvCpaFileList.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:16px 0;">csv 目录下暂无可用文件</div>';
+            return;
+        }
+
+        elements.csvCpaFileList.innerHTML = data.files.map(file => `
+            <div class="csv-cpa-file-item" style="
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                gap:12px;
+                padding:12px 14px;
+                border:1px solid var(--border);
+                border-radius:10px;
+                background:var(--surface);
+            ">
+                <div style="min-width:0;display:flex;flex-direction:column;gap:4px;">
+                    <div style="font-weight:600;word-break:break-all;">${escapeHtml(file.name)}</div>
+                    <div style="font-size:0.82rem;color:var(--text-muted);display:flex;gap:10px;flex-wrap:wrap;">
+                        <span>记录数: ${file.record_count == null ? '解析失败' : format.number(file.record_count)}</span>
+                        <span>大小: ${format.bytes(file.size || 0)}</span>
+                        <span>修改时间: ${format.date(file.modified_at)}</span>
+                    </div>
+                </div>
+                <button class="btn btn-primary btn-sm export-csv-file-btn" data-filename="${escapeHtml(file.name)}">
+                    导出 CPA
+                </button>
+            </div>
+        `).join('');
+
+        elements.csvCpaFileList.querySelectorAll('.export-csv-file-btn').forEach(button => {
+            button.addEventListener('click', () => exportCsvDirectoryFileToCpa(button.dataset.filename));
+        });
+    } catch (error) {
+        console.error('加载 csv 文件失败:', error);
+        elements.csvCpaDirectory.textContent = '加载失败';
+        elements.csvCpaFileList.innerHTML = `<div style="text-align:center;color:var(--danger-color);padding:16px 0;">${escapeHtml(error.message || '加载失败')}</div>`;
+    }
+}
+
+function updateSelectedCsvUpload() {
+    const file = elements.csvCpaUploadInput.files && elements.csvCpaUploadInput.files[0];
+    elements.csvCpaUploadName.textContent = file ? file.name : '未选择文件';
+}
+
+async function exportCsvDirectoryFileToCpa(filename) {
+    try {
+        toast.info(`正在刷新并导出 ${filename}...`);
+        const response = await fetch('/api/accounts/export/cpa-from-csv-file', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ filename })
+        });
+
+        await downloadResponse(response, 'cpa_tokens.zip');
+        toast.success('CSV 刷新并导出成功');
+    } catch (error) {
+        console.error('CSV 文件导出失败:', error);
+        toast.error('CSV 导出失败: ' + error.message);
+    }
+}
+
+async function exportUploadedCsvToCpa() {
+    const file = elements.csvCpaUploadInput.files && elements.csvCpaUploadInput.files[0];
+    if (!file) {
+        toast.warning('请先选择 CSV 文件');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+        toast.info(`正在刷新并导出 ${file.name}...`);
+        const response = await fetch('/api/accounts/export/cpa-from-csv-upload', {
+            method: 'POST',
+            body: formData
+        });
+
+        await downloadResponse(response, 'cpa_tokens.zip');
+        toast.success('CSV 刷新并导出成功');
+    } catch (error) {
+        console.error('上传 CSV 导出失败:', error);
+        toast.error('CSV 导出失败: ' + error.message);
     }
 }
 

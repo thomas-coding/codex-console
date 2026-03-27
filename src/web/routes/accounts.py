@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Body
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Body, File, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -23,16 +23,18 @@ from ...core.openai.overview import fetch_codex_overview
 from ...core.openai.token_refresh import refresh_account_token as do_refresh
 from ...core.openai.token_refresh import validate_account_token as do_validate
 from ...core.upload.cpa_upload import generate_token_json, batch_upload_to_cpa, upload_to_cpa
+from ...core.upload.csv_cpa import parse_csv_accounts, refresh_csv_records_for_cpa, build_cpa_export_content
 from ...core.upload.team_manager_upload import upload_to_team_manager, batch_upload_to_team_manager
 from ...core.upload.sub2api_upload import batch_upload_to_sub2api, upload_to_sub2api
 
 from ...core.dynamic_proxy import get_proxy_url_for_task
 from ...database import crud
-from ...database.models import Account
+from ...database.models import Account, EmailService as EmailServiceModel
 from ...database.session import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+ACCOUNT_OUTLOOK_RECOVERY_KEY = "outlook_recovery"
 
 CURRENT_ACCOUNT_SETTING_KEY = "codex.current_account_id"
 OVERVIEW_EXTRA_DATA_KEY = "codex_overview"
@@ -43,6 +45,10 @@ INVALID_ACCOUNT_STATUSES = (
     AccountStatus.FAILED.value,
     AccountStatus.EXPIRED.value,
     AccountStatus.BANNED.value,
+)
+CSV_DIR_CANDIDATES = (
+    Path.cwd() / "csv",
+    Path(__file__).resolve().parents[3] / "csv",
 )
 
 
@@ -72,6 +78,87 @@ def _apply_status_filter(query, status: Optional[str]):
     if normalized in {"failed", "invalid"}:
         return query.filter(Account.status.in_(INVALID_ACCOUNT_STATUSES))
     return query.filter(Account.status == normalized)
+
+
+def _resolve_csv_dir() -> Path:
+    for candidate in CSV_DIR_CANDIDATES:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return CSV_DIR_CANDIDATES[0]
+
+
+def _resolve_csv_file(filename: str) -> Path:
+    csv_dir = _resolve_csv_dir().resolve()
+    candidate = (csv_dir / (filename or "")).resolve()
+    if candidate.parent != csv_dir or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="CSV 文件不存在")
+    if candidate.suffix.lower() != ".csv":
+        raise HTTPException(status_code=400, detail="仅支持 .csv 文件")
+    return candidate
+
+
+def _build_cpa_stream_response(payloads: List[dict], report: Optional[dict] = None) -> StreamingResponse:
+    filename, content, media_type = build_cpa_export_content(payloads, report=report)
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+def _build_outlook_export_lookup(db) -> Dict[str, Dict[str, str]]:
+    lookup: Dict[str, Dict[str, str]] = {}
+    services = db.query(EmailServiceModel).filter(EmailServiceModel.service_type == "outlook").all()
+    for service in services:
+        config = service.config or {}
+        payload = {
+            "service_name": str(service.name or "").strip(),
+            "email": str(config.get("email") or service.name or "").strip(),
+            "password": str(config.get("password") or "").strip(),
+            "client_id": str(config.get("client_id") or "").strip(),
+            "refresh_token": str(config.get("refresh_token") or "").strip(),
+        }
+        for key in (
+            payload["service_name"].lower(),
+            payload["email"].lower(),
+            str(service.id).strip(),
+        ):
+            if key:
+                lookup[key] = payload
+    return lookup
+
+
+def _normalize_outlook_export_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    source = payload if isinstance(payload, dict) else {}
+    return {
+        "email": str(source.get("email") or "").strip(),
+        "password": str(source.get("password") or "").strip(),
+        "client_id": str(source.get("client_id") or "").strip(),
+        "refresh_token": str(source.get("refresh_token") or "").strip(),
+    }
+
+
+def _resolve_account_outlook_export_payload(account: Account, outlook_lookup: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    stored_payload = {}
+    extra_data = getattr(account, "extra_data", None)
+    if isinstance(extra_data, dict):
+        stored_payload = _normalize_outlook_export_payload(extra_data.get(ACCOUNT_OUTLOOK_RECOVERY_KEY))
+
+    lookup_payload = {}
+    if str(account.email_service or "").strip().lower() == "outlook":
+        for key in (
+            str(account.email_service_id or "").strip().lower(),
+            str(account.email or "").strip().lower(),
+        ):
+            if key and key in outlook_lookup:
+                lookup_payload = _normalize_outlook_export_payload(outlook_lookup[key])
+                break
+
+    merged = dict(lookup_payload)
+    for key, value in stored_payload.items():
+        if value:
+            merged[key] = value
+    return merged
 
 
 # ============== Pydantic Models ==============
@@ -1474,6 +1561,42 @@ class BatchExportRequest(BaseModel):
     search_filter: Optional[str] = None
 
 
+class CsvFileExportRequest(BaseModel):
+    """按 csv 目录文件导出 CPA 请求"""
+    filename: str
+
+
+@router.get("/csv-files")
+async def list_csv_files():
+    """列出项目 csv 目录中的账号导出文件"""
+    csv_dir = _resolve_csv_dir()
+    if not csv_dir.exists():
+        return {"directory": str(csv_dir), "files": []}
+
+    files = []
+    for path in sorted(csv_dir.glob("*.csv"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            records = parse_csv_accounts(path.read_bytes())
+        except Exception as exc:
+            logger.warning("解析 CSV 文件失败: %s - %s", path, exc)
+            record_count = None
+        else:
+            record_count = len(records)
+
+        stat = path.stat()
+        files.append({
+            "name": path.name,
+            "size": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "record_count": record_count,
+        })
+
+    return {
+        "directory": str(csv_dir),
+        "files": files,
+    }
+
+
 @router.post("/export/json")
 async def export_accounts_json(request: BatchExportRequest):
     """导出账号为 JSON 格式"""
@@ -1519,7 +1642,7 @@ async def export_accounts_json(request: BatchExportRequest):
 
 @router.post("/export/csv")
 async def export_accounts_csv(request: BatchExportRequest):
-    """导出账号为 CSV 格式"""
+    """导出账号为 CSV 格式（包含 Outlook 完整恢复所需字段）"""
     import csv
     import io
 
@@ -1529,6 +1652,7 @@ async def export_accounts_csv(request: BatchExportRequest):
             request.status_filter, request.email_service_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
+        outlook_lookup = _build_outlook_export_lookup(db)
 
         # 创建 CSV 内容
         output = io.StringIO()
@@ -1539,11 +1663,13 @@ async def export_accounts_csv(request: BatchExportRequest):
             "ID", "Email", "Password", "Client ID",
             "Account ID", "Workspace ID",
             "Access Token", "Refresh Token", "ID Token", "Session Token",
-            "Email Service", "Status", "Registered At", "Last Refresh", "Expires At"
+            "Email Service", "Status", "Registered At", "Last Refresh", "Expires At",
+            "Outlook Email", "Outlook Password", "Outlook Client ID", "Outlook Refresh Token"
         ])
 
         # 写入数据
         for acc in accounts:
+            outlook = _resolve_account_outlook_export_payload(acc, outlook_lookup)
             writer.writerow([
                 acc.id,
                 acc.email,
@@ -1559,7 +1685,11 @@ async def export_accounts_csv(request: BatchExportRequest):
                 acc.status,
                 acc.registered_at.isoformat() if acc.registered_at else "",
                 acc.last_refresh.isoformat() if acc.last_refresh else "",
-                acc.expires_at.isoformat() if acc.expires_at else ""
+                acc.expires_at.isoformat() if acc.expires_at else "",
+                outlook.get("email", ""),
+                outlook.get("password", ""),
+                outlook.get("client_id", ""),
+                outlook.get("refresh_token", ""),
             ])
 
         # 生成文件名
@@ -1712,6 +1842,60 @@ async def export_accounts_cpa(request: BatchExportRequest):
             media_type="application/zip",
             headers={"Content-Disposition": f"attachment; filename={zip_filename}"}
         )
+
+
+@router.post("/export/cpa-from-csv-file")
+async def export_accounts_cpa_from_csv_file(request: CsvFileExportRequest):
+    """将 csv 目录中的账号文件按原刷新链路更新后导出为 CPA JSON/ZIP"""
+    csv_path = _resolve_csv_file(request.filename)
+
+    try:
+        records = parse_csv_accounts(csv_path.read_bytes())
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 编码不支持: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 解析失败: {exc}") from exc
+
+    if not records:
+        raise HTTPException(status_code=400, detail="CSV 中没有可导出的账号记录")
+
+    proxy = _get_proxy()
+    payloads, report = refresh_csv_records_for_cpa(records, proxy_url=proxy)
+    if not payloads:
+        raise HTTPException(status_code=400, detail=report)
+    return _build_cpa_stream_response(payloads, report=report)
+
+
+@router.post("/export/cpa-from-csv-upload")
+async def export_accounts_cpa_from_csv_upload(file: UploadFile = File(...)):
+    """上传 CSV，按原刷新链路更新后导出为 CPA JSON/ZIP"""
+    filename = (file.filename or "").strip()
+    if filename and not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="仅支持 .csv 文件")
+
+    try:
+        content = await file.read()
+    finally:
+        await file.close()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="上传的 CSV 文件为空")
+
+    try:
+        records = parse_csv_accounts(content)
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 编码不支持: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 解析失败: {exc}") from exc
+
+    if not records:
+        raise HTTPException(status_code=400, detail="CSV 中没有可导出的账号记录")
+
+    proxy = _get_proxy()
+    payloads, report = refresh_csv_records_for_cpa(records, proxy_url=proxy)
+    if not payloads:
+        raise HTTPException(status_code=400, detail=report)
+    return _build_cpa_stream_response(payloads, report=report)
 
 
 @router.get("/stats/summary")

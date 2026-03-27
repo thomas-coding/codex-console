@@ -63,7 +63,14 @@ git push origin develop
 - CSV complete export with Outlook recovery fields.
 - CSV-to-CPA export and relogin recovery flow.
 - Outlook recovery metadata duplicated into account records.
+- Registration-time IPRoyal sticky-session rotation for one-task-one-IP behavior.
 - Agent/architecture/state/maintenance knowledge base.
+
+## Proxy Notes
+
+- The DB proxy record for IPRoyal should be treated as a template, typically including `_country-...`, `_session-...`, and `_lifetime-...` in credentials.
+- Registration rewrites `_session-...` per task at runtime; it does not persist the rewritten session back into the proxy table.
+- This runtime rewrite is intentionally scoped to registration flows so it does not interfere with CSV export, CSV-to-CPA recovery, or other account-management actions.
 
 ## Useful Checks
 

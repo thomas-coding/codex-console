@@ -22,6 +22,7 @@
 
 - Registration/login:
   - Web route starts task.
+  - Registration route resolves the proxy once per task and rewrites IPRoyal sticky-session credentials at runtime so each task gets a fresh sticky IP while the task itself stays on one IP.
   - `RegistrationEngine` drives email creation, OTP, login fallback, OAuth callback, token/session capture.
   - Result persists to `accounts`.
 - Account export:
@@ -55,6 +56,8 @@
 - `main` mirrors upstream state; custom work lands on `develop`.
 - Outlook recovery data is duplicated into account records to survive later mailbox deletion.
 - CSV-to-CPA is not a raw format conversion; it is a token-recovery flow that may refresh or relogin before emitting CPA JSON.
+- IPRoyal proxy records in DB are treated as templates for registration; task startup may rewrite `_session-...` on the fly, but the stored proxy record is not mutated.
+- Outlook batch registration should use `concurrency=1` when the goal is "one mailbox, one fresh IP, then next mailbox".
 
 ## Known Risks
 

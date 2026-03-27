@@ -6,8 +6,10 @@ import asyncio
 import logging
 import uuid
 import random
+import re
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -30,6 +32,69 @@ batch_tasks: Dict[str, dict] = {}
 
 
 # ============== Proxy Helper Functions ==============
+
+_IPROYAL_HOST_MARKER = "iproyal.com"
+_IPROYAL_SESSION_PATTERN = re.compile(r"_session-[^_@]+", re.IGNORECASE)
+
+
+def _rewrite_iproyal_sticky_session(proxy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    为 IPRoyal 粘性代理生成新的 session id。
+
+    仅在代理 URL 指向 IPRoyal 且认证信息中包含 `_session-...` 时改写。
+    这样可以保证：
+    - 同一个注册任务内复用同一条 sticky 代理
+    - 不同注册任务自动切换到新的 sticky session / IP
+    """
+    raw_proxy = str(proxy_url or "").strip()
+    if not raw_proxy:
+        return proxy_url, None
+
+    try:
+        parsed = urlsplit(raw_proxy)
+        hostname = str(parsed.hostname or "").strip().lower()
+        if _IPROYAL_HOST_MARKER not in hostname:
+            return raw_proxy, None
+
+        netloc = str(parsed.netloc or "").strip()
+        if not netloc or "@" not in netloc:
+            return raw_proxy, None
+
+        auth, host_part = netloc.rsplit("@", 1)
+        if ":" not in auth:
+            return raw_proxy, None
+
+        username, password = auth.split(":", 1)
+        session_id = uuid.uuid4().hex[:8]
+        rewritten = False
+
+        if _IPROYAL_SESSION_PATTERN.search(username):
+            username = _IPROYAL_SESSION_PATTERN.sub(f"_session-{session_id}", username, count=1)
+            rewritten = True
+        if _IPROYAL_SESSION_PATTERN.search(password):
+            password = _IPROYAL_SESSION_PATTERN.sub(f"_session-{session_id}", password, count=1)
+            rewritten = True
+
+        if not rewritten:
+            return raw_proxy, None
+
+        updated_proxy = urlunsplit((
+            parsed.scheme,
+            f"{username}:{password}@{host_part}",
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        ))
+        return updated_proxy, session_id
+    except Exception as exc:
+        logger.warning(f"改写 IPRoyal session 失败，回退原代理: {exc}")
+        return raw_proxy, None
+
+
+def _prepare_registration_proxy(proxy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """为注册任务准备最终代理 URL。"""
+    return _rewrite_iproyal_sticky_session(proxy_url)
+
 
 def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
     """
@@ -261,6 +326,12 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 actual_proxy_url, proxy_id = get_proxy_for_registration(db)
                 if actual_proxy_url:
                     logger.info(f"任务 {task_uuid} 使用代理: {actual_proxy_url[:50]}...")
+
+            actual_proxy_url, iproyal_session_id = _prepare_registration_proxy(actual_proxy_url)
+            if iproyal_session_id:
+                logger.info(f"任务 {task_uuid} 使用新的 IPRoyal sticky session: {iproyal_session_id}")
+                session_msg = f"[系统] IPRoyal 粘性代理已切换新会话: {iproyal_session_id}"
+                task_manager.add_log(task_uuid, f"{log_prefix} {session_msg}" if log_prefix else session_msg)
 
             # 更新任务的代理记录
             crud.update_registration_task(db, task_uuid, proxy=actual_proxy_url)

@@ -18,6 +18,8 @@
 - Added complete CSV export fields for Outlook recovery material.
 - Stored Outlook recovery credentials into `accounts.extra_data.outlook_recovery` so CSV export still works after mailbox-service deletion.
 - Added Web UI support for CSV-to-CPA export from file list or upload.
+- Added registration-time IPRoyal sticky-session rewriting so each registration task gets a fresh proxy session/IP while keeping a stable IP inside the task.
+- Confirmed Outlook batch registration can run sequentially with `skip_registered=true`, consuming one Outlook mailbox per task without reusing already-registered mailboxes.
 - Separated repository workflow:
   `main` for upstream sync, `develop` for fork-specific work.
 
@@ -40,6 +42,7 @@
 - `agent.md`
 - `MAINTENANCE.md`
 - `ARCHITECTURE.md`
+- `src/web/routes/registration.py`
 - `src/core/upload/csv_cpa.py`
 - `src/core/register.py`
 - `src/web/routes/accounts.py`

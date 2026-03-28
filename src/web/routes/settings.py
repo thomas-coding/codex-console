@@ -46,6 +46,7 @@ class RegistrationSettings(BaseModel):
     """注册设置"""
     max_retries: int = 3
     timeout: int = 120
+    token_exchange_max_retries: int = 3
     default_password_length: int = 12
     sleep_min: int = 5
     sleep_max: int = 30
@@ -95,6 +96,7 @@ async def get_all_settings():
         "registration": {
             "max_retries": settings.registration_max_retries,
             "timeout": settings.registration_timeout,
+            "token_exchange_max_retries": settings.registration_token_exchange_max_retries,
             "default_password_length": settings.registration_default_password_length,
             "sleep_min": settings.registration_sleep_min,
             "sleep_max": settings.registration_sleep_max,
@@ -226,6 +228,7 @@ async def get_registration_settings():
     return {
         "max_retries": settings.registration_max_retries,
         "timeout": settings.registration_timeout,
+        "token_exchange_max_retries": settings.registration_token_exchange_max_retries,
         "default_password_length": settings.registration_default_password_length,
         "sleep_min": settings.registration_sleep_min,
         "sleep_max": settings.registration_sleep_max,
@@ -246,6 +249,7 @@ async def update_registration_settings(request: RegistrationSettings):
     update_settings(
         registration_max_retries=request.max_retries,
         registration_timeout=request.timeout,
+        registration_token_exchange_max_retries=request.token_exchange_max_retries,
         registration_default_password_length=request.default_password_length,
         registration_sleep_min=request.sleep_min,
         registration_sleep_max=request.sleep_max,

@@ -338,6 +338,7 @@ async function loadSettings() {
         // 注册配置
         document.getElementById('max-retries').value = data.registration?.max_retries || 3;
         document.getElementById('timeout').value = data.registration?.timeout || 120;
+        document.getElementById('token-exchange-max-retries').value = data.registration?.token_exchange_max_retries || 3;
         document.getElementById('password-length').value = data.registration?.default_password_length || 12;
         const entryFlowRaw = String(data.registration?.entry_flow || 'native').toLowerCase();
         const entryFlow = entryFlowRaw === 'abcard' ? 'abcard' : 'native';
@@ -484,6 +485,7 @@ async function handleSaveRegistration(e) {
     const data = {
         max_retries: parseInt(document.getElementById('max-retries').value),
         timeout: parseInt(document.getElementById('timeout').value),
+        token_exchange_max_retries: parseInt(document.getElementById('token-exchange-max-retries').value),
         default_password_length: parseInt(document.getElementById('password-length').value),
         entry_flow: document.getElementById('registration-entry-flow').value || 'native',
         browser_profile_enabled: document.getElementById('registration-browser-profile-enabled').checked,

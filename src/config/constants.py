@@ -276,6 +276,7 @@ DEFAULT_SETTINGS = [
     ("proxy.port", "7890", "代理端口", "proxy"),
     ("registration.max_retries", "3", "最大重试次数", "registration"),
     ("registration.timeout", "120", "超时时间（秒）", "registration"),
+    ("registration.token_exchange_max_retries", "3", "Token Exchange 最大重试次数", "registration"),
     ("registration.default_password_length", "12", "默认密码长度", "registration"),
     ("webui.host", "0.0.0.0", "Web UI 监听主机", "webui"),
     ("webui.port", "8000", "Web UI 监听端口", "webui"),

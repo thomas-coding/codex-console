@@ -151,6 +151,7 @@ class RegistrationEngine:
         self._create_account_workspace_id: Optional[str] = None
         self._create_account_account_id: Optional[str] = None
         self._create_account_refresh_token: Optional[str] = None
+        self._create_account_completed: bool = False
         self._last_validate_otp_continue_url: Optional[str] = None
         self._last_validate_otp_workspace_id: Optional[str] = None
         self._last_register_password_error: Optional[str] = None
@@ -1573,6 +1574,42 @@ class RegistrationEngine:
 
         return True
 
+    def _finalize_created_account_without_tokens(
+        self,
+        result: RegistrationResult,
+        *,
+        workspace_id: Optional[str] = None,
+        warning_message: str,
+    ) -> bool:
+        """
+        新账号已在 create_account 阶段落成，但后续 token 收尾失败时，按“注册成功、token 待补”收尾。
+        这样账号密码和邮箱注册历史都会被保存，后续可通过 CSV/续跑流程补齐 token。
+        """
+        if self._is_existing_account or not self._create_account_completed:
+            return False
+
+        result.account_id = str(result.account_id or self._create_account_account_id or "").strip()
+        result.workspace_id = str(
+            result.workspace_id
+            or workspace_id
+            or self._last_validate_otp_workspace_id
+            or self._create_account_workspace_id
+            or ""
+        ).strip()
+        result.refresh_token = str(result.refresh_token or self._create_account_refresh_token or "").strip()
+        result.password = self.password or ""
+        result.source = "register"
+        result.device_id = result.device_id or str(self.device_id or "")
+        result.error_message = ""
+
+        try:
+            self._capture_auth_session_tokens(result, access_hint=result.access_token)
+        except Exception as e:
+            self._log(f"部分成功收尾时补抓会话信息失败: {e}", "warning")
+
+        self._log(warning_message, "warning")
+        return True
+
     def _complete_token_exchange_outlook(self, result: RegistrationResult) -> bool:
         """
         Outlook 入口链路（迁移版）：
@@ -1646,18 +1683,36 @@ class RegistrationEngine:
                 self._log("使用缓存 continue_url 继续授权链路", "warning")
 
         if not continue_url:
+            if self._finalize_created_account_without_tokens(
+                result,
+                workspace_id=workspace_id,
+                warning_message="未拿到 continue_url，但账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
+                return True
             result.error_message = "获取 Workspace ID 失败"
             return False
 
         self._log("顺着重定向面包屑往前走，别跟丢了...")
         callback_url, _final_url = self._follow_redirects(continue_url)
         if not callback_url:
+            if self._finalize_created_account_without_tokens(
+                result,
+                workspace_id=workspace_id,
+                warning_message="未命中 OAuth 回调，但账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
+                return True
             result.error_message = "跟随重定向链失败"
             return False
 
         self._log("处理 OAuth 回调，准备把 token 请出来...")
         token_info = self._handle_oauth_callback(callback_url)
         if not token_info:
+            if self._finalize_created_account_without_tokens(
+                result,
+                workspace_id=workspace_id,
+                warning_message="OAuth 回调处理失败，但账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
+                return True
             result.error_message = "处理 OAuth 回调失败"
             return False
 
@@ -1683,6 +1738,12 @@ class RegistrationEngine:
             self._log("Session Token 也捞到了，今天这网没白连")
 
         if not result.access_token:
+            if self._finalize_created_account_without_tokens(
+                result,
+                workspace_id=workspace_id,
+                warning_message="OAuth 回调已完成但未拿到 access_token，账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
+                return True
             result.error_message = "未获取到 access_token"
             return False
 
@@ -2331,6 +2392,21 @@ class RegistrationEngine:
             if self._validate_verification_code(code):
                 return True
 
+            if (
+                self._last_otp_validation_code == code
+                and self._last_otp_validation_outcome in {"network_timeout", "network_error"}
+            ):
+                if attempt < max_attempts:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次校验遇到网络异常"
+                        f"（{self._last_otp_validation_outcome}），优先重试同一验证码...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    if self._validate_verification_code(code):
+                        return True
+                continue
+
             if attempt < max_attempts:
                 self._log(
                     f"{stage_label}第 {attempt}/{max_attempts} 次校验未通过，疑似旧验证码，自动重试下一封...",
@@ -2346,21 +2422,41 @@ class RegistrationEngine:
             user_info = generate_random_user_info()
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
             create_account_body = json.dumps(user_info)
+            response = None
+            max_attempts = 2
 
-            response = self.session.post(
-                OPENAI_API_ENDPOINTS["create_account"],
-                headers={
-                    "referer": "https://auth.openai.com/about-you",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
-                data=create_account_body,
-            )
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = self.session.post(
+                        OPENAI_API_ENDPOINTS["create_account"],
+                        headers={
+                            "referer": "https://auth.openai.com/about-you",
+                            "accept": "application/json",
+                            "content-type": "application/json",
+                        },
+                        data=create_account_body,
+                    )
+                except cffi_requests.RequestsError as request_error:
+                    self._log(f"账户创建请求异常(第 {attempt}/{max_attempts} 次): {request_error}", "warning")
+                    if attempt < max_attempts:
+                        time.sleep(2 * attempt)
+                        continue
+                    return False
 
-            self._log(f"账户创建状态: {response.status_code}")
+                self._log(f"账户创建状态: {response.status_code}")
 
-            if response.status_code != 200:
+                if response.status_code == 200:
+                    break
+
+                retryable_server_error = response.status_code >= 500
                 self._log(f"账户创建失败: {response.text[:200]}", "warning")
+                if retryable_server_error and attempt < max_attempts:
+                    self._log(f"账户创建返回 {response.status_code}，准备重试 (第 {attempt + 1}/{max_attempts} 次)", "warning")
+                    time.sleep(2 * attempt)
+                    continue
+                return False
+
+            if response is None or response.status_code != 200:
                 return False
 
             try:
@@ -2395,6 +2491,8 @@ class RegistrationEngine:
                     self._log("create_account 返回 refresh_token，已缓存")
             except Exception:
                 pass
+
+            self._create_account_completed = True
 
             return True
 
@@ -2651,24 +2749,50 @@ class RegistrationEngine:
 
     def _handle_oauth_callback(self, callback_url: str) -> Optional[Dict[str, Any]]:
         """处理 OAuth 回调"""
-        try:
-            if not self.oauth_start:
-                self._log("OAuth 流程未初始化", "error")
-                return None
+        def _is_retryable_callback_error(error: Exception) -> bool:
+            message = str(error or "").lower()
+            if not message:
+                return False
+            if "network error" in message:
+                return True
+            if "timed out" in message or "timeout" in message or "curl: (28)" in message:
+                return True
+            return any(f"token exchange failed: {status}" in message for status in ("500", "502", "503", "504"))
 
-            self._log("处理 OAuth 回调，最后一哆嗦，稳住别抖...")
-            token_info = self.oauth_manager.handle_callback(
-                callback_url=callback_url,
-                expected_state=self.oauth_start.state,
-                code_verifier=self.oauth_start.code_verifier
-            )
-
-            self._log("OAuth 授权成功，通关文牒到手")
-            return token_info
-
-        except Exception as e:
-            self._log(f"处理 OAuth 回调失败: {e}", "error")
+        if not self.oauth_start:
+            self._log("OAuth 流程未初始化", "error")
             return None
+
+        settings = get_settings()
+        max_attempts = max(int(getattr(settings, "registration_token_exchange_max_retries", 3) or 3), 1)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if attempt == 1:
+                    self._log("处理 OAuth 回调，最后一哆嗦，稳住别抖...")
+                else:
+                    self._log(f"处理 OAuth 回调重试中 (第 {attempt}/{max_attempts} 次)...", "warning")
+
+                token_info = self.oauth_manager.handle_callback(
+                    callback_url=callback_url,
+                    expected_state=self.oauth_start.state,
+                    code_verifier=self.oauth_start.code_verifier
+                )
+
+                self._log("OAuth 授权成功，通关文牒到手")
+                return token_info
+
+            except Exception as e:
+                last_error = e
+                if attempt < max_attempts and _is_retryable_callback_error(e):
+                    self._log(f"处理 OAuth 回调遇到瞬时错误，准备重试: {e}", "warning")
+                    time.sleep(2 * attempt)
+                    continue
+                break
+
+        self._log(f"处理 OAuth 回调失败: {last_error}", "error")
+        return None
 
     def run(self) -> RegistrationResult:
         """
@@ -2692,6 +2816,7 @@ class RegistrationEngine:
             self._create_account_workspace_id = None
             self._create_account_account_id = None
             self._create_account_refresh_token = None
+            self._create_account_completed = False
             self._last_validate_otp_continue_url = None
             self._last_validate_otp_workspace_id = None
 
@@ -2715,7 +2840,7 @@ class RegistrationEngine:
                 self._log(f"IP 检查失败: {location}", "error")
                 return result
 
-            self._log(f"IP 位置: {location}")
+            self._log(f"IP 位置: {location or '未知（检测接口未返回地区，已继续）'}")
 
             # 2. 创建邮箱
             self._log("2. 开个新邮箱，准备收信...")
@@ -2853,25 +2978,52 @@ class RegistrationEngine:
                 extra_data[ACCOUNT_OUTLOOK_RECOVERY_KEY] = recovery_payload
 
             with get_db() as db:
-                # 保存账户信息
-                account = crud.create_account(
-                    db,
-                    email=result.email,
-                    password=result.password,
-                    client_id=settings.openai_client_id,
-                    session_token=result.session_token,
-                    cookies=self._dump_session_cookies(),
-                    email_service=self.email_service.service_type.value,
-                    email_service_id=self.email_info.get("service_id") if self.email_info else None,
-                    account_id=result.account_id,
-                    workspace_id=result.workspace_id,
-                    access_token=result.access_token,
-                    refresh_token=result.refresh_token,
-                    id_token=result.id_token,
-                    proxy_used=self.proxy_url,
-                    extra_data=extra_data,
-                    source=result.source
-                )
+                existing_account = crud.get_account_by_email(db, result.email)
+                cookies_text = self._dump_session_cookies()
+
+                if existing_account:
+                    merged_extra_data = dict(existing_account.extra_data or {})
+                    merged_extra_data.update(extra_data)
+                    account = crud.update_account(
+                        db,
+                        existing_account.id,
+                        password=str(result.password or "").strip() or None,
+                        client_id=str(settings.openai_client_id or "").strip() or None,
+                        session_token=str(result.session_token or "").strip() or None,
+                        cookies=str(cookies_text or "").strip() or None,
+                        email_service=self.email_service.service_type.value,
+                        email_service_id=self.email_info.get("service_id") if self.email_info else None,
+                        account_id=str(result.account_id or "").strip() or None,
+                        workspace_id=str(result.workspace_id or "").strip() or None,
+                        access_token=str(result.access_token or "").strip() or None,
+                        refresh_token=str(result.refresh_token or "").strip() or None,
+                        id_token=str(result.id_token or "").strip() or None,
+                        proxy_used=str(self.proxy_url or "").strip() or None,
+                        extra_data=merged_extra_data,
+                        source=str(result.source or "").strip() or None,
+                        status="active",
+                    )
+                    self._log(f"账户已按邮箱补全更新，落袋为安，ID: {account.id}")
+                else:
+                    account = crud.create_account(
+                        db,
+                        email=result.email,
+                        password=result.password,
+                        client_id=settings.openai_client_id,
+                        session_token=result.session_token,
+                        cookies=cookies_text,
+                        email_service=self.email_service.service_type.value,
+                        email_service_id=self.email_info.get("service_id") if self.email_info else None,
+                        account_id=result.account_id,
+                        workspace_id=result.workspace_id,
+                        access_token=result.access_token,
+                        refresh_token=result.refresh_token,
+                        id_token=result.id_token,
+                        proxy_used=self.proxy_url,
+                        extra_data=extra_data,
+                        source=result.source
+                    )
+                    self._log(f"账户已存进数据库，落袋为安，ID: {account.id}")
                 crud.upsert_registered_email(
                     db,
                     email=result.email,
@@ -2883,7 +3035,6 @@ class RegistrationEngine:
                     note="saved_from_registration_result",
                 )
 
-                self._log(f"账户已存进数据库，落袋为安，ID: {account.id}")
                 return True
 
         except Exception as e:

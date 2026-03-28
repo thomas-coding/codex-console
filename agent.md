@@ -17,6 +17,8 @@ Read this file first. Do not scan the whole repository by default.
 
 - Startup, local run, environment questions:
   Read `PROJECT_STATE.md` then `README.md`.
+- Deployment, Docker, server sync, or remote troubleshooting:
+  Read `MAINTENANCE.md` first.
 - Registration, login, token, Outlook, CSV, CPA tasks:
   Read `PROJECT_STATE.md` then `ARCHITECTURE.md`.
 - Registration hardening, proxy/session/IP rotation, browser-profile switch:

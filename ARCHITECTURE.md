@@ -25,6 +25,8 @@
   - Web route starts task.
   - Registration route resolves the proxy once per task, rewrites IPRoyal sticky-session credentials at runtime, probes the real public IP through `ipify`, and retries with a fresh session when the resolved IP matches the previous registration task's IP.
   - `RegistrationEngine` drives email creation, OTP, login fallback, OAuth callback, token/session capture.
+  - OTP validation distinguishes "old code" from transient network failures; network timeout/error on the newest code retries that same code before polling a later email.
+  - If `create_account` has already succeeded, later OAuth/token-tail failure may still be persisted as a usable partial-success account record so later CSV/CPA recovery can finish token acquisition.
   - Result persists to `accounts`.
 - Account export:
   - `src/web/routes/accounts.py` builds JSON/CSV export formats from DB records.
@@ -64,9 +66,12 @@
 - Real public-IP probing and same-IP retry currently apply only to registration tasks; CSV-to-CPA currently rotates session per record but does not verify the actual exit IP.
 - Outlook batch registration should use `concurrency=1` when the goal is "one mailbox, one fresh IP, then next mailbox".
 - Browser-profile simulation is currently opt-in and registration-only, controlled by `registration.browser_profile_enabled`; it affects registration HTTP/Sentinel parameters only and is designed to fall back cleanly when disabled.
+- OAuth callback exchange has its own setting `registration.token_exchange_max_retries`; this is separate from the top-level registration retry count.
+- IP geolocation lookup failure is non-fatal; only explicit blocked regions should stop registration.
 
 ## Known Risks
 
 - OpenAI auth pages and token exchange behavior change frequently.
 - Proxy/network instability can still break OAuth callback exchange.
+- Sticky sessions reduce but do not mathematically guarantee unique real exit IPs across concurrent or closely spaced tasks.
 - Local runtime folders contain sensitive data and should remain untracked.

@@ -125,11 +125,11 @@ def get_accounts(
 
 def update_account(
     db: Session,
-    account_id: int,
+    db_account_id: int,
     **kwargs
 ) -> Optional[Account]:
     """更新账户信息"""
-    db_account = get_account_by_id(db, account_id)
+    db_account = get_account_by_id(db, db_account_id)
     if not db_account:
         return None
 

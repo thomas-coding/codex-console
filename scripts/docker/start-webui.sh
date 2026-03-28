@@ -32,4 +32,3 @@ fi
 
 echo "[docker] starting webui..."
 exec python webui.py
-

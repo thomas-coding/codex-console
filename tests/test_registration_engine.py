@@ -1,9 +1,12 @@
 import base64
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
+from src.database import crud
+from src.database.session import DatabaseSessionManager
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
 from src.core.register import RegistrationEngine, RegistrationResult
@@ -415,3 +418,162 @@ def test_save_to_database_persists_outlook_recovery_payload(monkeypatch):
         "client_id": "mail-client",
         "refresh_token": "mail-refresh",
     }
+
+
+def test_outlook_finalize_partial_success_after_account_creation():
+    email_service = FakeEmailService(["654321"])
+    engine = RegistrationEngine(email_service)
+    engine.password = "openai-pass"
+    engine.device_id = "did-1"
+    engine._create_account_completed = True
+    engine._create_account_account_id = "acct-created"
+    engine._create_account_workspace_id = "ws-created"
+    engine._create_account_refresh_token = "refresh-created"
+    engine._last_validate_otp_workspace_id = "ws-from-otp"
+    engine._verify_email_otp_with_retry = lambda **kwargs: True
+    engine._get_workspace_id = lambda: ""
+    engine._select_workspace = lambda workspace_id: ""
+    engine._capture_auth_session_tokens = lambda result, access_hint=None: setattr(result, "session_token", "session-from-cookie")
+
+    result = RegistrationResult(success=False, email="tester@example.com")
+
+    assert engine._complete_token_exchange_outlook(result) is True
+    assert result.account_id == "acct-created"
+    assert result.workspace_id == "ws-from-otp"
+    assert result.refresh_token == "refresh-created"
+    assert result.password == "openai-pass"
+    assert result.session_token == "session-from-cookie"
+    assert result.source == "register"
+    assert result.error_message == ""
+
+
+def test_save_to_database_updates_existing_account_without_clobbering_tokens(monkeypatch, tmp_path):
+    db_path = Path(tmp_path) / "registration.db"
+    manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+    manager.create_tables()
+    manager.migrate_tables()
+
+    with manager.session_scope() as db:
+        existing = crud.create_account(
+            db,
+            email="tester@outlook.com",
+            password="old-openai-pass",
+            client_id="old-client",
+            session_token="old-session",
+            cookies="old-cookie",
+            email_service="outlook",
+            email_service_id="tester@outlook.com",
+            account_id="acct-old",
+            workspace_id="ws-old",
+            access_token="old-access",
+            refresh_token="old-refresh",
+            id_token="old-id",
+            proxy_used="old-proxy",
+            extra_data={"keep": "old", "old_only": True},
+            source="register",
+        )
+        existing_id = existing.id
+
+    @contextmanager
+    def fake_get_db():
+        db = manager.SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    email_service = OutlookService(
+        {
+            "email": "tester@outlook.com",
+            "password": "mail-pwd",
+            "client_id": "mail-client",
+            "refresh_token": "mail-refresh",
+        },
+        name="test-outlook",
+    )
+    engine = RegistrationEngine(email_service, proxy_url="socks5://proxy.example:1234")
+    engine.email_info = {"email": "tester@outlook.com", "service_id": "tester@outlook.com"}
+    engine._dump_session_cookies = lambda: "new-cookie"
+
+    monkeypatch.setattr("src.core.register.get_db", fake_get_db)
+    monkeypatch.setattr("src.core.register.get_settings", lambda: SimpleNamespace(openai_client_id="new-client"))
+
+    result = RegistrationResult(
+        success=True,
+        email="tester@outlook.com",
+        password="new-openai-pass",
+        account_id="",
+        workspace_id="ws-new",
+        access_token="",
+        refresh_token="refresh-new",
+        id_token="",
+        session_token="",
+        metadata={"new_flag": True},
+        source="register",
+    )
+
+    assert engine.save_to_database(result) is True
+
+    with manager.session_scope() as db:
+        saved = crud.get_account_by_email(db, "tester@outlook.com")
+        registered, record, _account = crud.get_registered_email_state(db, "tester@outlook.com")
+
+        assert saved is not None
+        assert saved.id == existing_id
+        assert saved.password == "new-openai-pass"
+        assert saved.client_id == "new-client"
+        assert saved.workspace_id == "ws-new"
+        assert saved.access_token == "old-access"
+        assert saved.refresh_token == "refresh-new"
+        assert saved.session_token == "old-session"
+        assert saved.cookies == "new-cookie"
+        assert saved.proxy_used == "socks5://proxy.example:1234"
+        assert saved.extra_data["keep"] == "old"
+        assert saved.extra_data["old_only"] is True
+        assert saved.extra_data["new_flag"] is True
+        assert saved.extra_data["outlook_recovery"] == {
+            "email": "tester@outlook.com",
+            "password": "mail-pwd",
+            "client_id": "mail-client",
+            "refresh_token": "mail-refresh",
+        }
+        assert registered is True
+        assert record is not None
+        assert record.status == "registered_success"
+
+
+def test_handle_oauth_callback_uses_dedicated_retry_setting(monkeypatch):
+    class RetryableOAuthManager:
+        def __init__(self):
+            self.calls = 0
+
+        def handle_callback(self, callback_url, expected_state, code_verifier):
+            self.calls += 1
+            if self.calls < 5:
+                raise RuntimeError("token exchange failed: network error: timeout")
+            return {
+                "account_id": "acct-retry",
+                "access_token": "access-retry",
+                "refresh_token": "refresh-retry",
+                "id_token": "id-retry",
+            }
+
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+    engine.oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/flow/1",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+    retry_oauth = RetryableOAuthManager()
+    engine.oauth_manager = retry_oauth
+
+    monkeypatch.setattr("src.core.register.get_settings", lambda: SimpleNamespace(registration_token_exchange_max_retries=5))
+    monkeypatch.setattr("src.core.register.time.sleep", lambda *_args, **_kwargs: None)
+
+    token_info = engine._handle_oauth_callback("http://localhost:1455/auth/callback?code=abc&state=state-1")
+
+    assert token_info is not None
+    assert token_info["access_token"] == "access-retry"
+    assert retry_oauth.calls == 5

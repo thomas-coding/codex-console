@@ -230,6 +230,12 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.REGISTRATION,
         description="注册超时时间（秒）"
     ),
+    "registration_token_exchange_max_retries": SettingDefinition(
+        db_key="registration.token_exchange_max_retries",
+        default_value=3,
+        category=SettingCategory.REGISTRATION,
+        description="Token Exchange 最大重试次数"
+    ),
     "registration_default_password_length": SettingDefinition(
         db_key="registration.default_password_length",
         default_value=12,
@@ -452,6 +458,7 @@ SETTING_TYPES: Dict[str, Type] = {
     "proxy_dynamic_enabled": bool,
     "registration_max_retries": int,
     "registration_timeout": int,
+    "registration_token_exchange_max_retries": int,
     "registration_default_password_length": int,
     "registration_sleep_min": int,
     "registration_sleep_max": int,
@@ -721,6 +728,7 @@ class Settings(BaseModel):
     # 注册配置
     registration_max_retries: int = 3
     registration_timeout: int = 120
+    registration_token_exchange_max_retries: int = 3
     registration_default_password_length: int = 12
     registration_sleep_min: int = 5
     registration_sleep_max: int = 30

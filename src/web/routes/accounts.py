@@ -1021,9 +1021,7 @@ async def list_accounts_overview_cards(
     账号总览卡片数据。
     """
     with get_db() as db:
-        query = db.query(Account).filter(
-            func.lower(Account.subscription_type).in_(PAID_SUBSCRIPTION_TYPES)
-        )
+        query = db.query(Account)
         if search:
             pattern = f"%{search}%"
             query = query.filter((Account.email.ilike(pattern)) | (Account.account_id.ilike(pattern)))
@@ -1069,9 +1067,6 @@ async def list_accounts_overview_cards(
                 if has_db_subscription
                 else (overview.get("plan_source") or "default")
             )
-            if not _is_paid_subscription(effective_plan_raw):
-                # Codex 账号管理仅允许 plus/team 账号进入。
-                continue
 
             rows.append(
                 {

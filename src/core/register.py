@@ -9,6 +9,7 @@ import time
 import logging
 import secrets
 import string
+import urllib.parse
 import uuid
 from typing import Optional, Dict, Any, Tuple, Callable, List
 from dataclasses import dataclass
@@ -853,6 +854,126 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"chatgpt 首页预热异常: {e}", "warning")
 
+    @staticmethod
+    def _is_registration_gate_url(url: str) -> bool:
+        candidate = str(url or "").strip().lower()
+        if not candidate:
+            return False
+        return ("auth.openai.com/about-you" in candidate) or ("auth.openai.com/add-phone" in candidate)
+
+    @staticmethod
+    def _is_oauth_callback_url(url: str) -> bool:
+        candidate = str(url or "").strip()
+        if not candidate:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+            path = (parsed.path or "").lower()
+            if ("/auth/callback" not in path) and ("/api/auth/callback/openai" not in path):
+                return False
+            query = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
+            return bool(query.get("code") or query.get("error"))
+        except Exception:
+            return False
+
+    def _merge_token_info_into_result(self, result: RegistrationResult, token_info: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(token_info, dict):
+            return
+        result.account_id = str(token_info.get("account_id") or result.account_id or "").strip()
+        result.access_token = str(token_info.get("access_token") or result.access_token or "").strip()
+        result.refresh_token = str(token_info.get("refresh_token") or result.refresh_token or "").strip()
+        result.id_token = str(token_info.get("id_token") or result.id_token or "").strip()
+
+    def _try_complete_from_otp_callback(self, result: RegistrationResult, stage_label: str) -> bool:
+        otp_continue = str(self._last_validate_otp_continue_url or "").strip()
+        if not self._is_oauth_callback_url(otp_continue):
+            return False
+
+        callback_has_error = ("error=" in otp_continue) and ("code=" not in otp_continue)
+        if callback_has_error:
+            self._log(f"{stage_label}返回 callback 但携带错误参数，跳过直连补 token: {otp_continue[:140]}...", "warning")
+        else:
+            self._log(f"{stage_label}返回 OAuth callback，优先用该 callback 补 session/token...", "warning")
+            token_info = self._handle_oauth_callback(otp_continue)
+            if token_info:
+                self._merge_token_info_into_result(result, token_info)
+            else:
+                self._log(f"{stage_label} callback 处理失败，继续走 workspace 兜底链路", "warning")
+
+        self._warmup_chatgpt_session()
+        if self._capture_auth_session_tokens(result, access_hint=result.access_token):
+            self._log(f"{stage_label} callback 已补齐 session/access")
+            return True
+
+        if result.access_token:
+            self._log(f"{stage_label} callback 已补到 access_token，但 session_token 仍缺失，继续走 workspace 兜底", "warning")
+        return False
+
+    def _try_complete_session_from_registration_gate(self, result: RegistrationResult, gate_url: str) -> bool:
+        gate = str(gate_url or "").strip()
+        if not self._is_registration_gate_url(gate):
+            return False
+
+        self._log("会话桥接落在 about-you/add-phone 门页，先顺着门页补齐 session/token...", "warning")
+        try:
+            self.session.get(
+                "https://chatgpt.com/",
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "referer": gate,
+                    "user-agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                },
+                timeout=20,
+            )
+        except Exception as e:
+            self._log(f"门页桥接补跳异常: {e}", "warning")
+
+        if self._capture_auth_session_tokens(result, access_hint=result.access_token):
+            self._log("门页桥接已补齐 session/access")
+            return True
+
+        self._warmup_chatgpt_session()
+        if self._capture_auth_session_tokens(result, access_hint=result.access_token):
+            self._log("门页桥接经首页预热后补齐 session/access")
+            return True
+        return False
+
+    def _finalize_result_with_current_tokens(
+        self,
+        result: RegistrationResult,
+        *,
+        workspace_hint: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> None:
+        if not result.account_id:
+            result.account_id = str(self._create_account_account_id or "").strip()
+        if not result.workspace_id:
+            result.workspace_id = str(
+                workspace_hint
+                or self._last_validate_otp_workspace_id
+                or self._create_account_workspace_id
+                or ""
+            ).strip()
+        if not result.workspace_id:
+            try:
+                result.workspace_id = str(self._get_workspace_id() or "").strip()
+            except Exception as e:
+                self._log(f"补齐当前 token 结果时获取 workspace_id 失败: {e}", "warning")
+        if not result.refresh_token:
+            result.refresh_token = str(self._create_account_refresh_token or "").strip()
+        result.password = self.password or ""
+        result.source = source or ("login" if self._is_existing_account else "register")
+        result.device_id = result.device_id or str(self.device_id or self.session.cookies.get("oai-did") or "")
+
+        session_cookie = self.session.cookies.get("__Secure-next-auth.session-token")
+        if session_cookie:
+            self.session_token = session_cookie
+            result.session_token = session_cookie
+            self._log("Session Token 也捞到了，今天这网没白连")
+
     def _capture_auth_session_tokens(self, result: RegistrationResult, access_hint: Optional[str] = None) -> bool:
         """
         直接通过 /api/auth/session 捕获 session_token + access_token。
@@ -1081,6 +1202,12 @@ class RegistrationEngine:
                 self._log("会话桥接进入登录页，尝试自动登录后继续抓取 session_token...")
                 if self._bridge_login_for_session_token(result):
                     return True
+            elif self._is_registration_gate_url(final_url):
+                if self._try_complete_session_from_registration_gate(result, final_url):
+                    return True
+                self._log("门页桥接未补齐 session/token，回退自动登录桥接再试一次...", "warning")
+                if self._bridge_login_for_session_token(result):
+                    return True
 
         self._warmup_chatgpt_session()
         cookie_text = self._dump_session_cookies()
@@ -1155,6 +1282,9 @@ class RegistrationEngine:
             if not self._verify_email_otp_with_retry(stage_label="会话桥接登录验证码", max_attempts=3):
                 self._log("会话桥接自动登录验证码校验失败", "warning")
                 return False
+
+            if self._try_complete_from_otp_callback(result, stage_label="登录 OTP"):
+                return True
 
             # OTP 成功后先直接抓一次 auth/session，避免无谓依赖 workspace 流程。
             self._warmup_chatgpt_session()
@@ -1284,6 +1414,10 @@ class RegistrationEngine:
                 return False
         else:
             self._log("ABCard 入口链路：跳过二次登录验证码，直接进入 workspace + redirect + auth/session 抓取")
+
+        if require_login_otp and self._try_complete_from_otp_callback(result, stage_label="登录 OTP"):
+            self._finalize_result_with_current_tokens(result)
+            return True
 
         self._log("摸一下 Workspace ID，看看该坐哪桌...")
         workspace_id = self._get_workspace_id()
@@ -1415,12 +1549,6 @@ class RegistrationEngine:
         原生入口对齐备份版收尾链路：
         登录验证码 -> Workspace -> redirect -> OAuth callback -> token 入袋。
         """
-        def _is_registration_gate_url(url: str) -> bool:
-            u = str(url or "").strip().lower()
-            if not u:
-                return False
-            return ("auth.openai.com/about-you" in u) or ("auth.openai.com/add-phone" in u)
-
         self._log("等待登录验证码到场，最后这位嘉宾还在路上...")
         self._log("核对登录验证码，验明正身一下...")
         login_otp_tried_codes: set[str] = set()
@@ -1459,6 +1587,10 @@ class RegistrationEngine:
                 result.error_message = "验证码校验失败"
                 return False
 
+        if self._try_complete_from_otp_callback(result, stage_label="登录 OTP"):
+            self._finalize_result_with_current_tokens(result)
+            return True
+
         self._log("摸一下 Workspace ID，看看该坐哪桌...")
         workspace_id = str(self._last_validate_otp_workspace_id or "").strip()
         if workspace_id:
@@ -1470,15 +1602,7 @@ class RegistrationEngine:
 
         continue_url = ""
         otp_continue = str(self._last_validate_otp_continue_url or "").strip()
-        if otp_continue and _is_registration_gate_url(otp_continue):
-            self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
-            otp_continue = ""
-
         cached_continue = str(self._create_account_continue_url or "").strip()
-        if cached_continue and _is_registration_gate_url(cached_continue):
-            self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
-            cached_continue = ""
-
         if workspace_id:
             self._log("选择 Workspace，安排个靠谱座位...")
             continue_url = str(self._select_workspace(workspace_id) or "").strip()
@@ -1501,11 +1625,17 @@ class RegistrationEngine:
 
         if not continue_url and otp_continue:
             continue_url = otp_continue
-            self._log("使用 OTP 返回 continue_url 继续授权链路", "warning")
+            if self._is_registration_gate_url(otp_continue):
+                self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），先顺着门页继续 bridge", "warning")
+            else:
+                self._log("使用 OTP 返回 continue_url 继续授权链路", "warning")
 
         if not continue_url and cached_continue:
             continue_url = cached_continue
-            self._log("使用 create_account 缓存 continue_url 作为兜底", "warning")
+            if self._is_registration_gate_url(cached_continue):
+                self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），先顺着门页继续 bridge", "warning")
+            else:
+                self._log("使用 create_account 缓存 continue_url 作为兜底", "warning")
 
         if not continue_url:
             result.error_message = "获取 continue_url 失败"
@@ -1655,6 +1785,10 @@ class RegistrationEngine:
         if not login_otp_ok:
             result.error_message = "验证码校验失败"
             return False
+
+        if self._try_complete_from_otp_callback(result, stage_label="登录 OTP"):
+            self._finalize_result_with_current_tokens(result)
+            return True
 
         self._log("摸一下 Workspace ID，看看该坐哪桌...")
         workspace_id = str(self._last_validate_otp_workspace_id or "").strip()

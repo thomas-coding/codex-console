@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, desc, asc, func
 
+from ..core.account_archive import write_account_archive_snapshot
 from .models import Account, EmailService, RegisteredEmail, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
 
 
@@ -81,6 +82,7 @@ def create_account(
     db.add(db_account)
     db.commit()
     db.refresh(db_account)
+    write_account_archive_snapshot(db_account, db=db, reason="create")
     return db_account
 
 
@@ -139,6 +141,7 @@ def update_account(
 
     db.commit()
     db.refresh(db_account)
+    write_account_archive_snapshot(db_account, db=db, reason="update")
     return db_account
 
 
@@ -148,6 +151,7 @@ def delete_account(db: Session, account_id: int) -> bool:
     if not db_account:
         return False
 
+    write_account_archive_snapshot(db_account, db=db, reason="delete")
     db.delete(db_account)
     db.commit()
     return True
@@ -155,6 +159,9 @@ def delete_account(db: Session, account_id: int) -> bool:
 
 def delete_accounts_batch(db: Session, account_ids: List[int]) -> int:
     """批量删除账户"""
+    accounts = db.query(Account).filter(Account.id.in_(account_ids)).all()
+    for account in accounts:
+        write_account_archive_snapshot(account, db=db, reason="batch_delete")
     result = db.query(Account).filter(Account.id.in_(account_ids)).delete(synchronize_session=False)
     db.commit()
     return result

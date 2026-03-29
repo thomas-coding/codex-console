@@ -58,3 +58,6 @@ backups/
 /out/
 /csv/
 /csvoutput/
+/temp/
+/.tmp_*.json
+/*_recovery_report.json

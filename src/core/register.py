@@ -101,6 +101,7 @@ class RegistrationEngine:
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None,
         browser_profile: Optional[BrowserProfile] = None,
+        token_required_for_success: bool = False,
     ):
         """
         初始化注册引擎
@@ -111,12 +112,14 @@ class RegistrationEngine:
             callback_logger: 日志回调函数
             task_uuid: 任务 UUID（用于数据库记录）
             browser_profile: 可选的统一浏览器画像；未提供时回退原有逻辑
+            token_required_for_success: 兼容服务器路由的严格模式开关；当前实现不强制依赖
         """
         self.email_service = email_service
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
         self.browser_profile = browser_profile
+        self.token_required_for_success = bool(token_required_for_success)
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url, browser_profile=browser_profile)

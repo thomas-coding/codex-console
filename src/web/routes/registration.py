@@ -334,6 +334,61 @@ def _get_outlook_email_registration_state(db, email: str):
     return is_registered, registration_record, existing_account
 
 
+def _get_reserved_email_service_ids(
+    db,
+    *,
+    exclude_task_uuid: Optional[str] = None,
+) -> set[int]:
+    """返回当前已被 pending/running 注册任务占用的邮箱服务 ID。"""
+    query = db.query(RegistrationTask.email_service_id).filter(
+        RegistrationTask.email_service_id.isnot(None),
+        RegistrationTask.status.in_(("pending", "running")),
+    )
+    if exclude_task_uuid:
+        query = query.filter(RegistrationTask.task_uuid != exclude_task_uuid)
+    return {
+        int(service_id)
+        for service_id, in query.all()
+        if service_id is not None
+    }
+
+
+def _get_available_outlook_services(
+    db,
+    *,
+    limit: Optional[int] = None,
+    exclude_task_uuid: Optional[str] = None,
+):
+    """按优先级返回未注册且未被活动任务占用的 Outlook 账户。"""
+    from ...database.models import EmailService as EmailServiceModel
+
+    reserved_ids = _get_reserved_email_service_ids(db, exclude_task_uuid=exclude_task_uuid)
+    outlook_services = db.query(EmailServiceModel).filter(
+        EmailServiceModel.service_type == "outlook",
+        EmailServiceModel.enabled == True,
+    ).order_by(EmailServiceModel.priority.asc()).all()
+
+    available_services = []
+    for svc in outlook_services:
+        if svc.id in reserved_ids:
+            continue
+
+        email = svc.config.get("email") if svc.config else None
+        if not email:
+            continue
+
+        is_registered, _, _ = _get_outlook_email_registration_state(db, email)
+        if is_registered:
+            logger.info(f"跳过已注册的 Outlook 账户: {email}")
+            continue
+
+        available_services.append(svc)
+        if limit is not None and len(available_services) >= limit:
+            break
+
+    return available_services
+
+
 def _format_browser_profile_log(profile) -> str:
     profile_data = profile.to_log_dict()
     return (
@@ -372,6 +427,10 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
             # 更新 TaskManager 状态
             task_manager.update_status(task_uuid, "running")
+
+            if not email_service_id and task.email_service_id:
+                email_service_id = task.email_service_id
+                logger.info(f"任务 {task_uuid} 使用预绑定邮箱服务 ID: {email_service_id}")
 
             # 确定使用的代理
             # 如果前端传入了代理参数，使用传入的
@@ -487,33 +546,19 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     else:
                         raise ValueError("没有可用的自定义域名邮箱服务，请先在设置中配置")
                 elif service_type == EmailServiceType.OUTLOOK:
-                    # 检查数据库中是否有可用的 Outlook 账户
-                    from ...database.models import EmailService as EmailServiceModel
-                    # 获取所有启用的 Outlook 服务
-                    outlook_services = db.query(EmailServiceModel).filter(
-                        EmailServiceModel.service_type == "outlook",
-                        EmailServiceModel.enabled == True
-                    ).order_by(EmailServiceModel.priority.asc()).all()
-
-                    if not outlook_services:
+                    available_outlook_services = _get_available_outlook_services(
+                        db,
+                        limit=1,
+                        exclude_task_uuid=task_uuid,
+                    )
+                    if not available_outlook_services:
                         raise ValueError("没有可用的 Outlook 账户，请先在设置中导入账户")
 
-                    # 找到一个未注册的 Outlook 账户
-                    selected_service = None
-                    for svc in outlook_services:
-                        email = svc.config.get("email") if svc.config else None
-                        if not email:
-                            continue
-                        is_registered, _, _ = _get_outlook_email_registration_state(db, email)
-                        if not is_registered:
-                            selected_service = svc
-                            logger.info(f"选择未注册的 Outlook 账户: {email}")
-                            break
-                        else:
-                            logger.info(f"跳过已注册的 Outlook 账户: {email}")
-
+                    selected_service = available_outlook_services[0]
                     if selected_service and selected_service.config:
-                        config = selected_service.config.copy()
+                        selected_email = selected_service.config.get("email") if selected_service.config else ""
+                        logger.info(f"选择未注册的 Outlook 账户: {selected_email}")
+                        config = _normalize_email_service_config(service_type, selected_service.config, actual_proxy_url)
                         crud.update_registration_task(db, task_uuid, email_service_id=selected_service.id)
                         logger.info(f"使用数据库 Outlook 账户: {selected_service.name}")
                     else:
@@ -1067,14 +1112,47 @@ async def start_batch_registration(
     # 创建批量任务
     batch_id = str(uuid.uuid4())
     task_uuids = []
+    prebound_outlook_service_ids: List[int] = []
+
+    if request.email_service_type == EmailServiceType.OUTLOOK.value:
+        if request.email_service_id is not None and request.count > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Outlook 通用批量不能重复使用同一个邮箱服务 ID；请改用 Outlook 批量选择多个 service_ids。",
+            )
+        if request.email_service_config and request.count > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Outlook 通用批量不能对同一份邮箱配置重复发起多任务；请导入多个 Outlook 账户后重试。",
+            )
 
     with get_db() as db:
+        if (
+            request.email_service_type == EmailServiceType.OUTLOOK.value
+            and request.email_service_id is None
+            and not request.email_service_config
+        ):
+            prebound_outlook_services = _get_available_outlook_services(db, limit=request.count)
+            prebound_outlook_service_ids = [svc.id for svc in prebound_outlook_services]
+            if len(prebound_outlook_service_ids) < request.count:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"可用的未注册 Outlook 账户不足：需要 {request.count} 个，"
+                        f"当前仅 {len(prebound_outlook_service_ids)} 个。"
+                    ),
+                )
+
         for _ in range(request.count):
             task_uuid = str(uuid.uuid4())
+            prebound_service_id = None
+            if prebound_outlook_service_ids:
+                prebound_service_id = prebound_outlook_service_ids[len(task_uuids)]
             task = crud.create_registration_task(
                 db,
                 task_uuid=task_uuid,
-                proxy=request.proxy
+                proxy=request.proxy,
+                email_service_id=prebound_service_id or request.email_service_id,
             )
             task_uuids.append(task_uuid)
 
@@ -1090,7 +1168,7 @@ async def start_batch_registration(
         request.email_service_type,
         request.proxy,
         request.email_service_config,
-        request.email_service_id,
+        None if prebound_outlook_service_ids else request.email_service_id,
         request.interval_min,
         request.interval_max,
         request.concurrency,

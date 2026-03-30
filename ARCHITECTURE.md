@@ -29,14 +29,19 @@
 - Runtime:
   - actual user-facing runs happen on the Ubuntu server deployment.
   - operational checks should target container `app_webui_1`, not the local repo's DB/log files, unless the user explicitly says local.
+  - runtime hotfix deployment is expected to use file copy + `docker cp` + container restart; avoid rebuilding Docker images unless explicitly requested.
 
 ## Key Flows
 
 - Registration/login:
   - Web route starts task.
+  - Settings layer now exposes Browser First controls for registration:
+    `registration.browser_first_enabled`, `registration.browser_headless`, and `registration.browser_persistent_profile_dir`.
   - Registration route resolves the proxy once per task, rewrites IPRoyal sticky-session credentials at runtime, probes the real public IP through `ipify`, and retries with a fresh session when the resolved IP matches the previous registration task's IP.
+  - Generic Outlook batch startup now prebinds unique `email_service_id`s before scheduling tasks, so concurrent workers do not race on the same "first unregistered" Outlook mailbox.
   - Batch registration can optionally enable `exclusive_ip_concurrency`: this adds a second concurrency gate above the existing batch scheduler so only that many tasks may run in "independent IP" mode simultaneously, and those active tasks try not to claim the same real exit IP.
   - `RegistrationEngine` drives email creation, OTP, login fallback, OAuth callback, token/session capture.
+  - Registration tail handling now prefers fresh callback/session reuse across `about-you` / `add-phone` / OTP callback branches before falling back to legacy relogin.
   - OTP validation distinguishes "old code" from transient network failures; network timeout/error on the newest code retries that same code before polling a later email.
   - If `create_account` has already succeeded, later OAuth/token-tail failure may still be persisted as a usable partial-success account record so later CSV/CPA recovery can finish token acquisition.
   - Result persists to `accounts`.
@@ -73,6 +78,7 @@
 ## Important Decisions
 
 - `main` mirrors upstream state; custom work lands on `develop`.
+- `develop2` is obsolete and can be removed once current work is pushed from `develop`.
 - Outlook recovery data is duplicated into account records to survive later mailbox deletion.
 - Account archive snapshots are file-based on purpose, to decouple long-term recovery material from runtime table cleanup.
 - CSV-to-CPA is not a raw format conversion; it is a token-recovery flow that may refresh or relogin before emitting CPA JSON.
@@ -80,9 +86,12 @@
 - Runtime session rewriting currently applies to registration tasks and CSV-to-CPA per-record recovery tasks.
 - Real public-IP probing and same-IP retry currently apply only to registration tasks; CSV-to-CPA currently rotates session per record but does not verify the actual exit IP.
 - Outlook batch registration should use `concurrency=1` when the goal is "one mailbox, one fresh IP, then next mailbox".
+- Generic Outlook batch with `count > 1` should not reuse one explicit mailbox/config; either prebind distinct database Outlook accounts or use the explicit Outlook batch route with `service_ids`.
 - Browser-profile simulation is currently opt-in and registration-only, controlled by `registration.browser_profile_enabled`; it affects registration HTTP/Sentinel parameters only and is designed to fall back cleanly when disabled.
+- Browser First registration controls are also opt-in and are intended only for OTP / continue / callback / session-bridge tail handling.
 - OAuth callback exchange has its own setting `registration.token_exchange_max_retries`; this is separate from the top-level registration retry count.
 - IP geolocation lookup failure is non-fatal; only explicit blocked regions should stop registration.
+- SQLite runtime now relies on a larger connection pool and keeps `app_logs` DB writes at `warning/error` level to avoid log-write saturation during large registration batches.
 
 ## Known Risks
 

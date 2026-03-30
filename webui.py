@@ -85,7 +85,9 @@ def setup_application():
         log_level=settings.log_level,
         log_file=log_file
     )
-    install_database_log_handler()
+    # 任务详细日志已经单独写入 registration_tasks，后台 app_logs 只保留 warning/error，
+    # 避免大批量注册时重复写入 info 日志把数据库连接池打满。
+    install_database_log_handler(logging.WARNING)
 
     logger = logging.getLogger(__name__)
     logger.info("数据库初始化完成，地基已经打好")

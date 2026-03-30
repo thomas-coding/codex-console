@@ -344,6 +344,9 @@ async function loadSettings() {
         const entryFlow = entryFlowRaw === 'abcard' ? 'abcard' : 'native';
         document.getElementById('registration-entry-flow').value = entryFlow;
         document.getElementById('registration-browser-profile-enabled').checked = data.registration?.browser_profile_enabled === true;
+        document.getElementById('registration-browser-first-enabled').checked = data.registration?.browser_first_enabled === true;
+        document.getElementById('registration-browser-headless').checked = data.registration?.browser_headless !== false;
+        document.getElementById('registration-browser-persistent-profile-dir').value = data.registration?.browser_persistent_profile_dir || '';
         document.getElementById('sleep-min').value = data.registration?.sleep_min || 5;
         document.getElementById('sleep-max').value = data.registration?.sleep_max || 30;
 
@@ -489,6 +492,9 @@ async function handleSaveRegistration(e) {
         default_password_length: parseInt(document.getElementById('password-length').value),
         entry_flow: document.getElementById('registration-entry-flow').value || 'native',
         browser_profile_enabled: document.getElementById('registration-browser-profile-enabled').checked,
+        browser_first_enabled: document.getElementById('registration-browser-first-enabled').checked,
+        browser_headless: document.getElementById('registration-browser-headless').checked,
+        browser_persistent_profile_dir: document.getElementById('registration-browser-persistent-profile-dir').value || '',
         sleep_min: parseInt(document.getElementById('sleep-min').value),
         sleep_max: parseInt(document.getElementById('sleep-max').value),
     };

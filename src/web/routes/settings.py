@@ -52,6 +52,9 @@ class RegistrationSettings(BaseModel):
     sleep_max: int = 30
     entry_flow: str = "native"
     browser_profile_enabled: bool = False
+    browser_first_enabled: bool = False
+    browser_headless: bool = True
+    browser_persistent_profile_dir: str = ""
 
 
 class WebUISettings(BaseModel):
@@ -102,6 +105,9 @@ async def get_all_settings():
             "sleep_max": settings.registration_sleep_max,
             "entry_flow": entry_flow,
             "browser_profile_enabled": settings.registration_browser_profile_enabled,
+            "browser_first_enabled": settings.registration_browser_first_enabled,
+            "browser_headless": settings.registration_browser_headless,
+            "browser_persistent_profile_dir": settings.registration_browser_persistent_profile_dir,
         },
         "webui": {
             "host": settings.webui_host,
@@ -234,6 +240,9 @@ async def get_registration_settings():
         "sleep_max": settings.registration_sleep_max,
         "entry_flow": entry_flow,
         "browser_profile_enabled": settings.registration_browser_profile_enabled,
+        "browser_first_enabled": settings.registration_browser_first_enabled,
+        "browser_headless": settings.registration_browser_headless,
+        "browser_persistent_profile_dir": settings.registration_browser_persistent_profile_dir,
     }
 
 
@@ -255,6 +264,9 @@ async def update_registration_settings(request: RegistrationSettings):
         registration_sleep_max=request.sleep_max,
         registration_entry_flow=flow,
         registration_browser_profile_enabled=request.browser_profile_enabled,
+        registration_browser_first_enabled=request.browser_first_enabled,
+        registration_browser_headless=request.browser_headless,
+        registration_browser_persistent_profile_dir=str(request.browser_persistent_profile_dir or "").strip(),
     )
 
     return {"success": True, "message": "注册设置已更新"}

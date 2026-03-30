@@ -43,11 +43,21 @@ class DatabaseSessionManager:
                 database_url = f"sqlite:///{db_path}"
 
         self.database_url = _build_sqlalchemy_url(database_url)
+        is_sqlite = self.database_url.startswith("sqlite")
+        connect_args = {"check_same_thread": False} if is_sqlite else {}
+        default_pool_size = "64" if is_sqlite else "20"
+        default_max_overflow = "128" if is_sqlite else "40"
+        default_pool_timeout = "120" if is_sqlite else "60"
+        default_pool_recycle = "1800"
         self.engine = create_engine(
             self.database_url,
-            connect_args={"check_same_thread": False} if self.database_url.startswith("sqlite") else {},
+            connect_args=connect_args,
             echo=False,  # 设置为 True 可以查看所有 SQL 语句
-            pool_pre_ping=True  # 连接池预检查
+            pool_pre_ping=True,  # 连接池预检查
+            pool_size=max(1, int(os.environ.get("APP_DB_POOL_SIZE", default_pool_size))),
+            max_overflow=max(0, int(os.environ.get("APP_DB_MAX_OVERFLOW", default_max_overflow))),
+            pool_timeout=max(5, int(os.environ.get("APP_DB_POOL_TIMEOUT", default_pool_timeout))),
+            pool_recycle=max(30, int(os.environ.get("APP_DB_POOL_RECYCLE", default_pool_recycle))),
         )
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
 

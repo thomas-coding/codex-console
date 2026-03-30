@@ -507,6 +507,38 @@
                                 </label>
                             </div>
 
+                            <div class="form-group">
+                                <label style="display:flex; align-items:flex-start; gap:8px;">
+                                    <input type="checkbox" id="registration-browser-first-enabled" name="browser_first_enabled" style="margin-top: 4px;">
+                                    <span>
+                                        启用 Browser First 收尾
+                                        <span class="hint" style="display:block;">
+                                            对 OTP、continue_url、callback、about-you / add-phone 门页优先交给浏览器完成，再回退 HTTP 主链
+                                        </span>
+                                    </span>
+                                </label>
+                            </div>
+
+                            <div class="form-group">
+                                <label style="display:flex; align-items:flex-start; gap:8px;">
+                                    <input type="checkbox" id="registration-browser-headless" name="browser_headless" style="margin-top: 4px;" checked>
+                                    <span>
+                                        BrowserClient 使用无头模式
+                                        <span class="hint" style="display:block;">
+                                            关闭后会以可见浏览器运行，更接近手动指纹浏览器，但会占用更多资源
+                                        </span>
+                                    </span>
+                                </label>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="registration-browser-persistent-profile-dir">持久浏览器画像目录</label>
+                                    <input type="text" id="registration-browser-persistent-profile-dir" name="browser_persistent_profile_dir" placeholder="/opt/codex-browser-profiles">
+                                    <span class="hint">留空则每次使用临时 profile；填写目录后会按代理/IP 维度复用浏览器数据目录</span>
+                                </div>
+                            </div>
+
                             <div class="form-row">
                                 <div class="form-group">
                                     <label for="sleep-min">最小等待时间 (秒)</label>

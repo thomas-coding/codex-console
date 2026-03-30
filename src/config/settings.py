@@ -266,6 +266,24 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.REGISTRATION,
         description="是否启用统一浏览器画像（关闭时完全走原有请求参数逻辑）"
     ),
+    "registration_browser_first_enabled": SettingDefinition(
+        db_key="registration.browser_first_enabled",
+        default_value=False,
+        category=SettingCategory.REGISTRATION,
+        description="是否优先使用浏览器完成 OTP/continue/session bridge，失败后再回退 HTTP 主链"
+    ),
+    "registration_browser_headless": SettingDefinition(
+        db_key="registration.browser_headless",
+        default_value=True,
+        category=SettingCategory.REGISTRATION,
+        description="注册链路 BrowserClient 是否使用无头模式"
+    ),
+    "registration_browser_persistent_profile_dir": SettingDefinition(
+        db_key="registration.browser_persistent_profile_dir",
+        default_value="",
+        category=SettingCategory.REGISTRATION,
+        description="注册链路 BrowserClient 持久浏览器画像目录；留空则每次使用临时目录"
+    ),
 
     # 邮箱服务配置
     "email_service_priority": SettingDefinition(
@@ -464,6 +482,9 @@ SETTING_TYPES: Dict[str, Type] = {
     "registration_sleep_max": int,
     "registration_entry_flow": str,
     "registration_browser_profile_enabled": bool,
+    "registration_browser_first_enabled": bool,
+    "registration_browser_headless": bool,
+    "registration_browser_persistent_profile_dir": str,
     "email_service_priority": dict,
     "tempmail_enabled": bool,
     "tempmail_timeout": int,
@@ -734,6 +755,9 @@ class Settings(BaseModel):
     registration_sleep_max: int = 30
     registration_entry_flow: str = "native"
     registration_browser_profile_enabled: bool = False
+    registration_browser_first_enabled: bool = False
+    registration_browser_headless: bool = True
+    registration_browser_persistent_profile_dir: str = ""
 
     # 邮箱服务配置
     email_service_priority: Dict[str, int] = {"tempmail": 0, "yyds_mail": 1, "outlook": 2, "moe_mail": 3}
@@ -780,6 +804,17 @@ class Settings(BaseModel):
 
 # 全局配置实例
 _settings: Optional[Settings] = None
+_settings_loaded_from_db: bool = False
+
+
+def _database_session_ready() -> bool:
+    try:
+        from ..database.session import get_session_manager
+
+        get_session_manager()
+        return True
+    except Exception:
+        return False
 
 
 def get_settings() -> Settings:
@@ -787,13 +822,18 @@ def get_settings() -> Settings:
     获取全局配置实例（单例模式）
     完全从数据库加载配置
     """
-    global _settings
-    if _settings is None:
+    global _settings, _settings_loaded_from_db
+    should_reload_from_db = _database_session_ready() and (not _settings_loaded_from_db)
+    if _settings is None or should_reload_from_db:
         # 先初始化默认设置（如果数据库中没有的话）
-        init_default_settings()
-        # 从数据库加载所有设置
-        settings_dict = _load_settings_from_db()
-        _settings = Settings(**settings_dict)
+        if _database_session_ready():
+            init_default_settings()
+            settings_dict = _load_settings_from_db()
+            _settings = Settings(**settings_dict)
+            _settings_loaded_from_db = True
+        else:
+            _settings = Settings(**{name: defn.default_value for name, defn in SETTING_DEFINITIONS.items()})
+            _settings_loaded_from_db = False
     return _settings
 
 
@@ -801,7 +841,7 @@ def update_settings(**kwargs) -> Settings:
     """
     更新配置并保存到数据库
     """
-    global _settings
+    global _settings, _settings_loaded_from_db
     if _settings is None:
         _settings = get_settings()
 
@@ -809,6 +849,7 @@ def update_settings(**kwargs) -> Settings:
     updated_data = _settings.model_dump()
     updated_data.update(kwargs)
     _settings = Settings(**updated_data)
+    _settings_loaded_from_db = _database_session_ready()
 
     # 保存到数据库
     _save_settings_to_db(**kwargs)

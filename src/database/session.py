@@ -4,7 +4,7 @@
 
 from contextlib import contextmanager
 from typing import Generator
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import SQLAlchemyError
 import os
@@ -13,6 +13,9 @@ import logging
 from .models import Base
 
 logger = logging.getLogger(__name__)
+
+SQLITE_BUSY_TIMEOUT_MS = 30000
+SQLITE_BUSY_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1000
 
 
 def _build_sqlalchemy_url(database_url: str) -> str:
@@ -43,13 +46,35 @@ class DatabaseSessionManager:
                 database_url = f"sqlite:///{db_path}"
 
         self.database_url = _build_sqlalchemy_url(database_url)
+        is_sqlite = self.database_url.startswith("sqlite")
+        connect_args = {}
+        if is_sqlite:
+            connect_args = {
+                "check_same_thread": False,
+                "timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
+            }
+
         self.engine = create_engine(
             self.database_url,
-            connect_args={"check_same_thread": False} if self.database_url.startswith("sqlite") else {},
+            connect_args=connect_args,
             echo=False,  # 设置为 True 可以查看所有 SQL 语句
             pool_pre_ping=True  # 连接池预检查
         )
+        if is_sqlite:
+            event.listen(self.engine, "connect", self._configure_sqlite_connection)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+
+    @staticmethod
+    def _configure_sqlite_connection(dbapi_connection, _connection_record):
+        """为 SQLite 连接启用更适合并发写入的 PRAGMA。"""
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
     def get_db(self) -> Generator[Session, None, None]:
         """

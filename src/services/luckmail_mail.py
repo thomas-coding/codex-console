@@ -8,16 +8,19 @@ import re
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..config.constants import OTP_CODE_PATTERN
+from ..core.http_client import HTTPClient, RequestConfig
 
 
 logger = logging.getLogger(__name__)
 _STATE_LOCK = threading.RLock()
+_RUNTIME_RESERVED_EMAILS: Dict[str, Dict[str, Any]] = {}
 # 申诉硬编码开关（临时）：False=关闭申诉提交；True=开启申诉提交。
 LUCKMAIL_APPEAL_ENABLED = False
 
@@ -66,6 +69,7 @@ class LuckMailService(BaseEmailService):
             "project_code": "openai",
             "email_type": "ms_graph",
             "preferred_domain": "",
+            "preset_mailboxes": "",
             # purchase: 购买邮箱 + token 拉码（可多次）
             # order: 创建接码订单 + 订单拉码（通常一次）
             "inbox_mode": "purchase",
@@ -87,31 +91,38 @@ class LuckMailService(BaseEmailService):
         self.config["project_code"] = str(self.config.get("project_code") or "openai").strip()
         self.config["email_type"] = str(self.config.get("email_type") or "ms_graph").strip()
         self.config["preferred_domain"] = str(self.config.get("preferred_domain") or "").strip().lstrip("@")
+        self.config["preset_mailboxes"] = self.config.get("preset_mailboxes") or ""
         self.config["inbox_mode"] = self._normalize_inbox_mode(self.config.get("inbox_mode"))
         self.config["reuse_existing_purchases"] = bool(self.config.get("reuse_existing_purchases", True))
         self.config["purchase_scan_pages"] = max(int(self.config.get("purchase_scan_pages") or 5), 1)
         self.config["purchase_scan_page_size"] = max(int(self.config.get("purchase_scan_page_size") or 100), 1)
         self.config["poll_interval"] = float(self.config.get("poll_interval") or 3.0)
         self.config["code_reuse_ttl"] = int(self.config.get("code_reuse_ttl") or 600)
+        self.config["reservation_ttl"] = max(int(self.config.get("reservation_ttl") or 1800), 60)
 
-        if not self.config["api_key"]:
-            raise ValueError("LuckMail 配置缺少 api_key")
+        self._openapi_base_url = self._normalize_openapi_base_url(self.config["base_url"])
+        self._preset_purchase_mailboxes = self._parse_preset_mailboxes(self.config.get("preset_mailboxes"))
+        self._http_client: Optional[HTTPClient] = None
+        self._reservation_owner = uuid.uuid4().hex
+        self._reserved_emails: Set[str] = set()
+
+        if not self.config["api_key"] and not self._preset_purchase_mailboxes:
+            raise ValueError("LuckMail 配置缺少 api_key，或至少提供一条已购邮箱")
         if not self.config["project_code"]:
             raise ValueError("LuckMail 配置缺少 project_code")
 
         client_cls = _load_luckmail_client_class()
-        if client_cls is None:
-            raise ValueError(
-                "未找到 LuckMail SDK，请先安装 luckmail 包或确保本地存在 tools/luckmail"
-            )
-
-        try:
-            self.client = client_cls(
-                base_url=self.config["base_url"],
-                api_key=self.config["api_key"],
-            )
-        except Exception as exc:
-            raise ValueError(f"初始化 LuckMail 客户端失败: {exc}")
+        self.client = None
+        if client_cls is not None and self.config["api_key"]:
+            try:
+                self.client = client_cls(
+                    base_url=self.config["base_url"],
+                    api_key=self.config["api_key"],
+                )
+            except Exception as exc:
+                logger.warning(f"LuckMail SDK 初始化失败，回退到 HTTP 模式: {exc}")
+        elif client_cls is None:
+            logger.warning("LuckMail SDK 不可用，回退到 HTTP 模式")
 
         self._orders_by_no: Dict[str, Dict[str, Any]] = {}
         self._orders_by_email: Dict[str, Dict[str, Any]] = {}
@@ -132,6 +143,205 @@ class LuckMailService(BaseEmailService):
             "code": "order",
         }
         return aliases.get(mode, "purchase")
+
+    def _normalize_openapi_base_url(self, raw: Any) -> str:
+        base = str(raw or "").strip().rstrip("/")
+        marker = "/api/v1/openapi"
+        if marker in base:
+            prefix, _, _ = base.partition(marker)
+            return f"{prefix}{marker}"
+        return f"{base}{marker}"
+
+    def _get_http_client(self) -> HTTPClient:
+        if self._http_client is None:
+            self._http_client = HTTPClient(
+                proxy_url=str(self.config.get("proxy_url") or "").strip() or None,
+                config=RequestConfig(
+                    timeout=max(int(self.config.get("timeout") or 30), 1),
+                    max_retries=max(int(self.config.get("max_retries") or 3), 1),
+                    retry_delay=1.0,
+                    impersonate="chrome110",
+                ),
+            )
+        return self._http_client
+
+    def _request_openapi(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        auth_required: bool = True,
+    ) -> Any:
+        headers = {"Accept": "application/json"}
+        if auth_required:
+            api_key = str(self.config.get("api_key") or "").strip()
+            if not api_key:
+                raise EmailServiceError("LuckMail 当前操作需要 API Key")
+            headers["X-API-Key"] = api_key
+
+        path_value = str(path or "").strip()
+        if not path_value.startswith("/"):
+            path_value = f"/{path_value}"
+        url = f"{self._openapi_base_url}{path_value}"
+
+        try:
+            response = self._get_http_client().request(
+                method.upper(),
+                url,
+                headers=headers,
+                params=params,
+                json=json_body,
+            )
+        except Exception as exc:
+            raise EmailServiceError(f"LuckMail HTTP 请求失败: {exc}") from exc
+
+        if response.status_code >= 400:
+            body_text = ""
+            try:
+                body_text = str(response.text or "").strip()
+            except Exception:
+                body_text = ""
+            detail = body_text[:300] if body_text else f"HTTP {response.status_code}"
+            raise EmailServiceError(f"LuckMail HTTP 请求失败: {detail}")
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise EmailServiceError(f"LuckMail 返回非 JSON 响应: {exc}") from exc
+
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            if code not in (None, 0, "0"):
+                message = str(payload.get("message") or payload.get("msg") or code).strip()
+                raise EmailServiceError(f"LuckMail API 返回失败: {message}")
+            if "data" in payload:
+                return payload.get("data")
+        return payload
+
+    def _raw_get_purchases(self, page: int, page_size: int, user_disabled: int = 0) -> Any:
+        return self._request_openapi(
+            "GET",
+            "/email/purchases",
+            params={
+                "page": page,
+                "page_size": page_size,
+                "user_disabled": user_disabled,
+            },
+            auth_required=True,
+        )
+
+    def _raw_create_order(self, **kwargs) -> Any:
+        return self._request_openapi(
+            "POST",
+            "/order/create",
+            json_body=kwargs,
+            auth_required=True,
+        )
+
+    def _raw_purchase_emails(self, **kwargs) -> Any:
+        return self._request_openapi(
+            "POST",
+            "/email/purchase",
+            json_body=kwargs,
+            auth_required=True,
+        )
+
+    def _raw_get_order_code(self, order_no: str) -> Any:
+        return self._request_openapi(
+            "GET",
+            f"/order/{order_no}/code",
+            auth_required=True,
+        )
+
+    def _raw_get_token_code(self, token: str) -> Any:
+        return self._request_openapi(
+            "GET",
+            f"/email/token/{token}/code",
+            auth_required=False,
+        )
+
+    def _raw_set_purchase_disabled(self, purchase_id: int, disabled: int) -> Any:
+        return self._request_openapi(
+            "PUT",
+            f"/email/purchases/{purchase_id}/disabled",
+            json_body={"disabled": disabled},
+            auth_required=True,
+        )
+
+    def _raw_cancel_order(self, order_no: str) -> Any:
+        return self._request_openapi(
+            "POST",
+            f"/order/{order_no}/cancel",
+            auth_required=True,
+        )
+
+    def _raw_get_balance(self) -> Any:
+        return self._request_openapi("GET", "/balance", auth_required=True)
+
+    def _raw_check_token_alive(self, token: str) -> Any:
+        return self._request_openapi(
+            "GET",
+            f"/email/token/{token}/alive",
+            auth_required=False,
+        )
+
+    def _parse_preset_mailboxes(self, raw: Any) -> List[Dict[str, Any]]:
+        if raw in (None, "", []):
+            return []
+
+        if isinstance(raw, str):
+            entries = [line.strip() for line in raw.splitlines() if line.strip()]
+        elif isinstance(raw, list):
+            entries = [item for item in raw if item not in (None, "")]
+        else:
+            raise ValueError("LuckMail preset_mailboxes 仅支持字符串或列表")
+
+        parsed: List[Dict[str, Any]] = []
+        for index, item in enumerate(entries, start=1):
+            email = ""
+            token = ""
+
+            if isinstance(item, str):
+                parts = [part.strip() for part in item.split("----", 1)]
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"LuckMail 已购邮箱格式无效，第 {index} 行应为 邮箱----tok_xxx"
+                    )
+                email, token = parts
+            elif isinstance(item, dict):
+                email = str(item.get("email") or item.get("address") or "").strip()
+                token = str(item.get("token") or item.get("service_id") or "").strip()
+            else:
+                raise ValueError(f"LuckMail 已购邮箱格式无效，第 {index} 项类型不支持")
+
+            email = self._normalize_email(email)
+            token = str(token or "").strip()
+            if not email or not token.startswith("tok_"):
+                raise ValueError(
+                    f"LuckMail 已购邮箱格式无效，第 {index} 行应为 邮箱----tok_xxx"
+                )
+
+            parsed.append(
+                {
+                    "id": token,
+                    "service_id": token,
+                    "order_no": "",
+                    "email": email,
+                    "token": token,
+                    "purchase_id": None,
+                    "inbox_mode": "purchase",
+                    "project_code": self.config.get("project_code"),
+                    "email_type": self.config.get("email_type"),
+                    "preferred_domain": self.config.get("preferred_domain"),
+                    "expired_at": "",
+                    "created_at": time.time(),
+                    "source": "preset_purchase",
+                }
+            )
+
+        return parsed
 
     def _extract_field(self, obj: Any, *keys: str) -> Any:
         if obj is None:
@@ -306,10 +516,80 @@ class LuckMailService(BaseEmailService):
             except Exception as exc:
                 logger.warning(f"LuckMail 写入状态文件失败: {path} - {exc}")
 
+    def _cleanup_runtime_reservations_locked(self, now_ts: Optional[float] = None) -> None:
+        current_ts = float(now_ts or time.time())
+        expired = []
+        for email, record in list(_RUNTIME_RESERVED_EMAILS.items()):
+            try:
+                expires_at = float(record.get("expires_at_ts") or 0)
+            except Exception:
+                expires_at = 0
+            if expires_at <= current_ts:
+                expired.append(email)
+
+        for email in expired:
+            _RUNTIME_RESERVED_EMAILS.pop(email, None)
+
+    def _reserve_runtime_email(
+        self,
+        email: str,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        allow_failed: bool = False,
+    ) -> bool:
+        email_norm = self._normalize_email(email)
+        if not email_norm:
+            return False
+
+        with _STATE_LOCK:
+            now_ts = time.time()
+            self._cleanup_runtime_reservations_locked(now_ts)
+
+            registered = self._load_email_index(self._registered_file)
+            failed = self._load_email_index(self._failed_file)
+            if self._reconcile_failed_over_registered(registered, failed):
+                self._save_email_index(self._registered_file, registered)
+
+            if email_norm in registered:
+                return False
+            if (not allow_failed) and email_norm in failed:
+                return False
+
+            existing = _RUNTIME_RESERVED_EMAILS.get(email_norm)
+            if existing and existing.get("owner") != self._reservation_owner:
+                return False
+
+            record = {
+                "email": email_norm,
+                "owner": self._reservation_owner,
+                "updated_at": self._now_iso(),
+                "expires_at_ts": now_ts + float(self.config.get("reservation_ttl") or 1800),
+            }
+            if extra:
+                for key, value in extra.items():
+                    if value not in (None, ""):
+                        record[key] = value
+
+            _RUNTIME_RESERVED_EMAILS[email_norm] = record
+            self._reserved_emails.add(email_norm)
+            return True
+
+    def _release_runtime_email(self, email: str, *, force: bool = False) -> None:
+        email_norm = self._normalize_email(email)
+        if not email_norm:
+            return
+
+        with _STATE_LOCK:
+            existing = _RUNTIME_RESERVED_EMAILS.get(email_norm)
+            if existing and (force or existing.get("owner") == self._reservation_owner):
+                _RUNTIME_RESERVED_EMAILS.pop(email_norm, None)
+            self._reserved_emails.discard(email_norm)
+
     def _mark_registered_email(self, email: str, extra: Optional[Dict[str, Any]] = None) -> None:
         email_norm = self._normalize_email(email)
         if not email_norm:
             return
+        self._release_runtime_email(email_norm, force=True)
         registered = self._load_email_index(self._registered_file)
         failed = self._load_email_index(self._failed_file)
         record = registered.get(email_norm, {"email": email_norm})
@@ -364,6 +644,7 @@ class LuckMailService(BaseEmailService):
         if not email_norm:
             return {}
 
+        self._release_runtime_email(email_norm, force=True)
         registered = self._load_email_index(self._registered_file)
         registered_record: Dict[str, Any] = {}
         if email_norm in registered:
@@ -601,16 +882,23 @@ class LuckMailService(BaseEmailService):
     def _iter_purchase_items(self, scan_pages: int, page_size: int):
         for page in range(1, scan_pages + 1):
             try:
-                page_result = self.client.user.get_purchases(
-                    page=page,
-                    page_size=page_size,
-                    user_disabled=0,
-                )
+                if self.client is not None:
+                    page_result = self.client.user.get_purchases(
+                        page=page,
+                        page_size=page_size,
+                        user_disabled=0,
+                    )
+                else:
+                    page_result = self._raw_get_purchases(
+                        page=page,
+                        page_size=page_size,
+                        user_disabled=0,
+                    )
             except Exception as exc:
                 logger.warning(f"LuckMail 拉取已购邮箱失败: page={page}, error={exc}")
                 break
 
-            items = list(getattr(page_result, "list", []) or [])
+            items = list(self._extract_field(page_result, "list", "items", "rows") or [])
             if not items:
                 break
 
@@ -723,7 +1011,51 @@ class LuckMailService(BaseEmailService):
                     },
                 )
                 continue
-            return info
+            if self._reserve_runtime_email(
+                email,
+                extra=info,
+                allow_failed=str(info.get("source") or "").strip().lower() == "resume_failed",
+            ):
+                return info
+        return None
+
+    def _pick_preset_purchase_inbox(self) -> Optional[Dict[str, Any]]:
+        if not self._preset_purchase_mailboxes:
+            return None
+
+        registered = self._load_email_index(self._registered_file)
+        failed = self._load_email_index(self._failed_file)
+        if self._reconcile_failed_over_registered(registered, failed):
+            self._save_email_index(self._registered_file, registered)
+
+        existing_in_db = self._query_existing_account_emails(
+            {
+                self._normalize_email((item or {}).get("email"))
+                for item in self._preset_purchase_mailboxes
+                if isinstance(item, dict)
+            }
+        )
+
+        for item in self._preset_purchase_mailboxes:
+            info = dict(item)
+            email = self._normalize_email(info.get("email"))
+            if not email:
+                continue
+            if email in existing_in_db:
+                self._mark_registered_email(
+                    email,
+                    extra={
+                        "source": "accounts_db",
+                        "token": info.get("token"),
+                        "purchase_id": info.get("purchase_id"),
+                    },
+                )
+                continue
+            if email in registered or email in failed:
+                continue
+            if self._reserve_runtime_email(email, extra=info):
+                return info
+
         return None
 
     def _create_order_inbox(
@@ -742,7 +1074,10 @@ class LuckMailService(BaseEmailService):
                 kwargs["domain"] = preferred_domain
             if specified_email:
                 kwargs["specified_email"] = specified_email
-            order = self.client.user.create_order(**kwargs)
+            if self.client is not None:
+                order = self.client.user.create_order(**kwargs)
+            else:
+                order = self._raw_create_order(**kwargs)
         except Exception as exc:
             self.update_status(False, exc)
             raise EmailServiceError(f"LuckMail 创建订单失败: {exc}")
@@ -809,7 +1144,10 @@ class LuckMailService(BaseEmailService):
             }
             if preferred_domain:
                 kwargs["domain"] = preferred_domain
-            purchased = self.client.user.purchase_emails(**kwargs)
+            if self.client is not None:
+                purchased = self.client.user.purchase_emails(**kwargs)
+            else:
+                purchased = self._raw_purchase_emails(**kwargs)
         except Exception as exc:
             self.update_status(False, exc)
             raise EmailServiceError(f"LuckMail 购买邮箱失败: {exc}")
@@ -857,7 +1195,10 @@ class LuckMailService(BaseEmailService):
             request_config.get("inbox_mode") or request_config.get("mode") or self.config.get("inbox_mode")
         )
 
-        if inbox_mode == "order":
+        preset_purchase = self._pick_preset_purchase_inbox()
+        if preset_purchase:
+            order_info = preset_purchase
+        elif inbox_mode == "order":
             order_info = self._create_order_inbox(
                 project_code=project_code,
                 email_type=email_type,
@@ -934,10 +1275,16 @@ class LuckMailService(BaseEmailService):
         while time.time() < deadline:
             try:
                 if inbox_mode == "purchase":
-                    result = self.client.user.get_token_code(token)
+                    if self.client is not None:
+                        result = self.client.user.get_token_code(token)
+                    else:
+                        result = self._raw_get_token_code(token)
                     status = "success" if bool(self._extract_field(result, "has_new_mail")) else "pending"
                 else:
-                    result = self.client.user.get_order_code(order_no)
+                    if self.client is not None:
+                        result = self.client.user.get_order_code(order_no)
+                    else:
+                        result = self._raw_get_order_code(order_no)
                     status = str(self._extract_field(result, "status") or "").strip().lower()
             except Exception as exc:
                 logger.warning(f"LuckMail 拉取验证码失败: {exc}")
@@ -986,6 +1333,7 @@ class LuckMailService(BaseEmailService):
 
     def delete_email(self, email_id: str) -> bool:
         order_info = self._find_order(email=email_id, email_id=email_id)
+        reserved_email = self._normalize_email((order_info or {}).get("email"))
         token = str((order_info or {}).get("token") or "").strip()
         purchase_id = str((order_info or {}).get("purchase_id") or "").strip()
         order_no = str((order_info or {}).get("order_no") or "").strip()
@@ -994,21 +1342,32 @@ class LuckMailService(BaseEmailService):
             raw_id = str(email_id or "").strip()
             if raw_id.startswith("tok_"):
                 token = raw_id
+            elif "@" in raw_id:
+                reserved_email = self._normalize_email(raw_id)
             else:
                 order_no = raw_id
 
         if not token and not order_no:
+            if reserved_email:
+                self._release_runtime_email(reserved_email, force=True)
+                return True
             return False
 
         try:
             if token and purchase_id.isdigit():
                 # 购买邮箱通常不支持直接删除，标记禁用即可。
                 try:
-                    self.client.user.set_purchase_disabled(int(purchase_id), 1)
+                    if self.client is not None:
+                        self.client.user.set_purchase_disabled(int(purchase_id), 1)
+                    else:
+                        self._raw_set_purchase_disabled(int(purchase_id), 1)
                 except Exception:
                     pass
             elif order_no:
-                self.client.user.cancel_order(order_no)
+                if self.client is not None:
+                    self.client.user.cancel_order(order_no)
+                else:
+                    self._raw_cancel_order(order_no)
 
             key = token or order_no
             item = self._orders_by_no.pop(key, None)
@@ -1016,10 +1375,13 @@ class LuckMailService(BaseEmailService):
                 email = str(item.get("email") or "").strip().lower()
                 if email:
                     self._orders_by_email.pop(email, None)
+                    reserved_email = self._normalize_email(email)
             if token:
                 self._recent_codes_by_order.pop(f"token:{token}", None)
             if order_no:
                 self._recent_codes_by_order.pop(f"order:{order_no}", None)
+            if reserved_email:
+                self._release_runtime_email(reserved_email, force=True)
             self.update_status(True)
             return True
         except Exception as exc:
@@ -1029,7 +1391,20 @@ class LuckMailService(BaseEmailService):
 
     def check_health(self) -> bool:
         try:
-            self.client.user.get_balance()
+            if self.client is not None:
+                self.client.user.get_balance()
+            elif self._preset_purchase_mailboxes:
+                token = str(self._preset_purchase_mailboxes[0].get("token") or "").strip()
+                if not token:
+                    return False
+                probe = self._raw_check_token_alive(token)
+                alive = self._extract_field(probe, "alive")
+                if alive is False:
+                    return False
+            elif self.config.get("api_key"):
+                self._raw_get_balance()
+            else:
+                return False
             self.update_status(True)
             return True
         except Exception as exc:
@@ -1046,6 +1421,7 @@ class LuckMailService(BaseEmailService):
             "email_type": self.config.get("email_type"),
             "preferred_domain": self.config.get("preferred_domain"),
             "inbox_mode": self.config.get("inbox_mode"),
+            "preset_mailbox_count": len(self._preset_purchase_mailboxes),
             "cached_orders": len(self._orders_by_no),
             "status": self.status.value,
         }

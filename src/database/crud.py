@@ -2,10 +2,12 @@
 数据库 CRUD 操作
 """
 
+import time
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, desc, asc, func
+from sqlalchemy import and_, or_, desc, asc, func, case, literal
+from sqlalchemy.exc import OperationalError
 
 from ..core.timezone_utils import utcnow_naive
 from ..config.constants import (
@@ -31,6 +33,25 @@ from .models import (
     TeamInviteRecord,
     OperationAuditLog,
 )
+
+SQLITE_LOCK_RETRY_ATTEMPTS = 6
+SQLITE_LOCK_RETRY_DELAY_SECONDS = 0.2
+
+
+def _is_sqlite_locked_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _run_db_write_with_retry(db: Session, operation):
+    """对 SQLite 锁冲突做有限重试，降低并发注册时的假失败。"""
+    for attempt in range(SQLITE_LOCK_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except OperationalError as exc:
+            db.rollback()
+            if not _is_sqlite_locked_error(exc) or attempt >= SQLITE_LOCK_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(SQLITE_LOCK_RETRY_DELAY_SECONDS * (attempt + 1))
 
 
 # ============================================================================
@@ -421,32 +442,49 @@ def update_registration_task(
     **kwargs
 ) -> Optional[RegistrationTask]:
     """更新注册任务状态"""
-    db_task = get_registration_task_by_uuid(db, task_uuid)
-    if not db_task:
-        return None
+    def _operation() -> Optional[RegistrationTask]:
+        db_task = get_registration_task_by_uuid(db, task_uuid)
+        if not db_task:
+            return None
 
-    for key, value in kwargs.items():
-        if hasattr(db_task, key):
-            setattr(db_task, key, value)
+        for key, value in kwargs.items():
+            if hasattr(db_task, key):
+                setattr(db_task, key, value)
 
-    db.commit()
-    db.refresh(db_task)
-    return db_task
+        db.commit()
+        db.refresh(db_task)
+        return db_task
+
+    return _run_db_write_with_retry(db, _operation)
 
 
 def append_task_log(db: Session, task_uuid: str, log_message: str) -> bool:
     """追加任务日志"""
-    db_task = get_registration_task_by_uuid(db, task_uuid)
-    if not db_task:
-        return False
+    append_expr = case(
+        (
+            or_(RegistrationTask.logs.is_(None), RegistrationTask.logs == ""),
+            log_message,
+        ),
+        else_=RegistrationTask.logs + literal("\n") + literal(log_message),
+    )
 
-    if db_task.logs:
-        db_task.logs += f"\n{log_message}"
-    else:
-        db_task.logs = log_message
+    def _operation() -> bool:
+        updated = (
+            db.query(RegistrationTask)
+            .filter(RegistrationTask.task_uuid == task_uuid)
+            .update(
+                {RegistrationTask.logs: append_expr},
+                synchronize_session=False,
+            )
+        )
+        if not updated:
+            db.rollback()
+            return False
 
-    db.commit()
-    return True
+        db.commit()
+        return True
+
+    return _run_db_write_with_retry(db, _operation)
 
 
 def delete_registration_task(db: Session, task_uuid: str) -> bool:
@@ -689,13 +727,16 @@ def delete_proxy(db: Session, proxy_id: int) -> bool:
 
 def update_proxy_last_used(db: Session, proxy_id: int) -> bool:
     """更新代理最后使用时间"""
-    db_proxy = get_proxy_by_id(db, proxy_id)
-    if not db_proxy:
-        return False
+    def _operation() -> bool:
+        db_proxy = get_proxy_by_id(db, proxy_id)
+        if not db_proxy:
+            return False
 
-    db_proxy.last_used = utcnow_naive()
-    db.commit()
-    return True
+        db_proxy.last_used = utcnow_naive()
+        db.commit()
+        return True
+
+    return _run_db_write_with_retry(db, _operation)
 
 
 def get_random_proxy(db: Session) -> Optional[Proxy]:

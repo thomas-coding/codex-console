@@ -271,6 +271,37 @@ docker-compose up -d
 
 - noVNC: `http://127.0.0.1:6080`
 
+### 替换已运行的 Ubuntu Docker 部署
+
+如果服务器上已经有一套在跑，且你只想替换代码、保留原来的 `data/` 和 `logs/`，可以直接用仓库里的 Windows 部署脚本：
+
+```powershell
+pwsh -File .\scripts\deploy_ubuntu_docker.ps1 -Host 43.153.119.162 -User root
+```
+
+本机前置条件：
+
+- Windows PowerShell 7 或更新版本
+- `tar`
+- PuTTY 命令行工具里的 `plink` 和 `pscp`
+
+脚本会自动完成这些步骤：
+
+- 本地打包代码，但排除 `data/`、`logs/`、测试缓存和临时目录
+- 上传到服务器临时目录
+- 先备份服务器旧代码到 `/opt/codex-console/backups/`
+- 原位替换 `/opt/codex-console/app` 下的代码，但保留 `data/`、`logs/`、`.env`
+- 自动识别 `docker-compose` 或 `docker compose`
+- 自动写入 `.dockerignore`，避免把运行目录打进 Docker 构建上下文
+- 用 `http://127.0.0.1:1455/api/settings/registration` 做健康检查
+
+健康检查返回 `200` 或 `401` 都算成功：
+
+- `200`: Web UI 可直接访问
+- `401`: Web UI 已启动，但当前启用了访问密码保护
+
+如果远端部署失败，脚本会先尝试用刚生成的代码备份回滚，再重新拉起容器。
+
 ### 使用 docker run
 
 ```bash

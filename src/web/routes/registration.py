@@ -6,8 +6,9 @@ import asyncio
 import logging
 import uuid
 import random
+import threading
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Tuple, Any
+from typing import List, Optional, Dict, Tuple, Any, Callable
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,6 +21,8 @@ from ...config.constants import (
 from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, ScheduledRegistrationJob, Proxy
+from ...core.http_client import HTTPClient, RequestConfig
+from ...core.proxy_runtime import prepare_runtime_proxy
 from ...core.register import RegistrationEngine, RegistrationResult
 from ...services import EmailServiceFactory, EmailServiceType
 from ...config.settings import get_settings, Settings
@@ -41,6 +44,8 @@ router = APIRouter()
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
+_registration_proxy_state_lock = threading.Lock()
+_last_registration_public_ip: Optional[str] = None
 
 
 def _cancel_batch_tasks(batch_id: str) -> None:
@@ -61,6 +66,105 @@ def _cancel_batch_tasks(batch_id: str) -> None:
 
 
 # ============== Proxy Helper Functions ==============
+
+def _prepare_registration_proxy(proxy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """为注册任务准备最终代理 URL。"""
+    return prepare_runtime_proxy(proxy_url)
+
+
+def _resolve_public_ip(proxy_url: Optional[str]) -> Optional[str]:
+    """通过代理查询当前真实出口 IP。"""
+    targets = (
+        "https://api64.ipify.org?format=json",
+        "https://api.ipify.org?format=json",
+    )
+    client = HTTPClient(
+        proxy_url=proxy_url,
+        config=RequestConfig(timeout=10, max_retries=1, retry_delay=0.5),
+    )
+    try:
+        for url in targets:
+            try:
+                response = client.get(url)
+                if response.status_code != 200:
+                    continue
+                payload = response.json()
+                ip = str((payload or {}).get("ip") or "").strip()
+                if ip:
+                    return ip
+            except Exception:
+                continue
+    except Exception:
+        return None
+    finally:
+        client.close()
+    return None
+
+
+def _prepare_registration_proxy_with_ip_check(
+    proxy_url: Optional[str],
+    *,
+    max_attempts: int = 4,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], int, bool]:
+    """
+    为注册任务准备代理，并尽量避免与上一任务复用同一个真实出口 IP。
+
+    Returns:
+        (final_proxy_url, session_id, public_ip, attempts, forced_reuse)
+    """
+    global _last_registration_public_ip
+
+    base_proxy = proxy_url
+    attempts = 0
+    final_proxy = proxy_url
+    final_session_id = None
+    final_public_ip = None
+    forced_reuse = False
+
+    def emit_log(message: str):
+        if log_callback:
+            log_callback(message)
+
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        candidate_proxy, session_id = _prepare_registration_proxy(base_proxy)
+        public_ip = _resolve_public_ip(candidate_proxy)
+        attempt_parts = [f"[系统] 代理准备第 {attempt}/{max_attempts} 次"]
+        if session_id:
+            attempt_parts.append(f"session={session_id}")
+        if public_ip:
+            attempt_parts.append(f"出口IP={public_ip}")
+        else:
+            attempt_parts.append("出口IP=未知")
+        emit_log("，".join(attempt_parts))
+
+        with _registration_proxy_state_lock:
+            previous_ip = _last_registration_public_ip
+            same_as_previous = bool(public_ip and previous_ip and public_ip == previous_ip)
+            can_retry = bool(session_id) and attempt < max_attempts
+
+            final_proxy = candidate_proxy
+            final_session_id = session_id
+            final_public_ip = public_ip
+
+            if same_as_previous and can_retry:
+                logger.warning(
+                    "注册任务代理出口 IP 与上一任务重复，重试切换 session: ip=%s, session=%s, attempt=%s/%s",
+                    public_ip,
+                    session_id,
+                    attempt,
+                    max_attempts,
+                )
+                emit_log(f"[警告] 当前出口 IP 与上一任务相同 ({public_ip})，继续切换新 session 重试")
+                continue
+
+            if public_ip:
+                _last_registration_public_ip = public_ip
+            forced_reuse = same_as_previous
+            break
+
+    return final_proxy, final_session_id, final_public_ip, attempts, forced_reuse
 
 def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
     """
@@ -89,9 +193,15 @@ def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
 
 
 def update_proxy_usage(db, proxy_id: Optional[int]):
-    """更新代理的使用时间"""
-    if proxy_id:
-        crud.update_proxy_last_used(db, proxy_id)
+    """更新代理的使用时间，失败时不影响主注册流程。"""
+    if not proxy_id:
+        return False
+
+    try:
+        return crud.update_proxy_last_used(db, proxy_id)
+    except Exception as e:
+        logger.warning(f"更新代理使用时间失败，已跳过: proxy_id={proxy_id}, error={e}")
+        return False
 
 
 # ============== Pydantic Models ==============
@@ -345,6 +455,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
     这个函数会被 run_in_executor 调用，运行在独立线程中
     """
+    persisted_success_result: Optional[RegistrationResult] = None
+
     with get_db() as db:
         try:
             # 检查是否已取消
@@ -377,18 +489,42 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 if actual_proxy_url:
                     logger.info(f"任务 {task_uuid} 使用代理: {actual_proxy_url[:50]}...")
 
+            def _task_proxy_log(message: str):
+                task_manager.add_log(task_uuid, f"{log_prefix} {message}" if log_prefix else message)
+
+            actual_proxy_url, iproyal_session_id, public_ip, proxy_prepare_attempts, forced_reuse = _prepare_registration_proxy_with_ip_check(
+                actual_proxy_url,
+                log_callback=_task_proxy_log,
+            )
+            if iproyal_session_id:
+                logger.info(f"任务 {task_uuid} 使用新的 IPRoyal sticky session: {iproyal_session_id}")
+                _task_proxy_log(f"[系统] IPRoyal 粘性代理已切换新会话: {iproyal_session_id}")
+            if public_ip:
+                logger.info(f"任务 {task_uuid} 当前真实出口 IP: {public_ip}")
+                _task_proxy_log(f"[系统] 当前真实出口 IP: {public_ip}")
+            elif actual_proxy_url:
+                logger.warning(f"任务 {task_uuid} 未能解析真实出口 IP")
+                _task_proxy_log("[警告] 未能解析当前真实出口 IP，将继续使用当前代理")
+            if proxy_prepare_attempts > 1:
+                _task_proxy_log(f"[系统] 为避免复用上一任务 IP，代理会话已重试 {proxy_prepare_attempts} 次")
+            if forced_reuse and public_ip:
+                reuse_msg = f"[警告] 多次切换后仍复用上一任务出口 IP: {public_ip}"
+                logger.warning("任务 %s %s", task_uuid, reuse_msg)
+                _task_proxy_log(reuse_msg)
+
             # 更新任务的代理记录
             crud.update_registration_task(db, task_uuid, proxy=actual_proxy_url)
 
             # 创建邮箱服务
             service_type = EmailServiceType(email_service_type)
             settings = get_settings()
+            bound_email_service_id = email_service_id if email_service_id is not None else task.email_service_id
 
             # 优先使用数据库中配置的邮箱服务
-            if email_service_id:
+            if bound_email_service_id is not None:
                 from ...database.models import EmailService as EmailServiceModel
                 db_service = db.query(EmailServiceModel).filter(
-                    EmailServiceModel.id == email_service_id,
+                    EmailServiceModel.id == bound_email_service_id,
                     EmailServiceModel.enabled == True
                 ).first()
 
@@ -399,7 +535,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                     logger.info(f"使用数据库邮箱服务: {db_service.name} (ID: {db_service.id}, 类型: {service_type.value})")
                 else:
-                    raise ValueError(f"邮箱服务不存在或已禁用: {email_service_id}")
+                    raise ValueError(f"邮箱服务不存在或已禁用: {bound_email_service_id}")
             else:
                 # 使用默认配置或传入的配置
                 if service_type == EmailServiceType.TEMPMAIL:
@@ -566,8 +702,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         logger.info(f"使用数据库 LuckMail 服务: {db_service.name}")
                     else:
                         config = _normalize_email_service_config(service_type, email_service_config or {}, actual_proxy_url)
-                        if not config.get("api_key"):
-                            raise ValueError("没有可用的 LuckMail 服务，请先在邮箱服务中添加并填写 API Key")
+                        if not config.get("api_key") and not config.get("preset_mailboxes"):
+                            raise ValueError("没有可用的 LuckMail 服务，请先在邮箱服务中添加 API Key 或已购邮箱列表")
                 else:
                     config = email_service_config or {}
 
@@ -595,13 +731,12 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     value = info.get(key) if isinstance(info, dict) else None
                     if value not in (None, ""):
                         marker_context[key] = value
+                if getattr(result, "password", None):
+                    marker_context["generated_password"] = result.password
             except Exception:
                 marker_context = {}
 
             if result.success:
-                # 更新代理使用时间
-                update_proxy_usage(db, proxy_id)
-
                 metadata = result.metadata if isinstance(result.metadata, dict) else {}
                 metadata["account_label"] = account_label
                 metadata["role_tag"] = role_tag
@@ -609,7 +744,31 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 result.metadata = metadata
 
                 # 保存到数据库
-                engine.save_to_database(result, account_label=account_label, role_tag=role_tag)
+                saved_ok = engine.save_to_database(result, account_label=account_label, role_tag=role_tag)
+                if not saved_ok:
+                    persist_error = "保存到数据库失败"
+                    if callable(marker) and result.email:
+                        try:
+                            marker(
+                                email=result.email,
+                                success=False,
+                                reason=persist_error,
+                                context=marker_context,
+                            )
+                        except Exception as mark_err:
+                            logger.warning(f"记录邮箱失败状态失败: {mark_err}")
+
+                    crud.update_registration_task(
+                        db, task_uuid,
+                        status="failed",
+                        completed_at=utcnow_naive(),
+                        error_message=persist_error
+                    )
+                    task_manager.update_status(task_uuid, "failed", error=persist_error)
+                    logger.warning(f"注册任务失败: {task_uuid}, 原因: {persist_error}")
+                    return
+
+                persisted_success_result = result
 
                 if callable(marker) and result.email:
                     try:
@@ -745,6 +904,9 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 task_manager.update_status(task_uuid, "completed", email=result.email)
 
                 logger.info(f"注册任务完成: {task_uuid}, 邮箱: {result.email}")
+
+                # 代理使用时间不再影响注册成功落库和任务完成状态
+                update_proxy_usage(db, proxy_id)
             else:
                 if callable(marker) and result.email:
                     try:
@@ -773,19 +935,37 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
         except Exception as e:
             logger.error(f"注册任务异常: {task_uuid}, 错误: {e}")
 
-            try:
-                with get_db() as db:
-                    crud.update_registration_task(
-                        db, task_uuid,
-                        status="failed",
-                        completed_at=utcnow_naive(),
-                        error_message=str(e)
+            if persisted_success_result:
+                try:
+                    with get_db() as recovery_db:
+                        crud.update_registration_task(
+                            recovery_db, task_uuid,
+                            status="completed",
+                            completed_at=utcnow_naive(),
+                            result=persisted_success_result.to_dict(),
+                            error_message=None,
+                        )
+                except Exception as recovery_error:
+                    logger.warning(f"任务 {task_uuid} completed 补偿回写失败: {recovery_error}")
+                finally:
+                    task_manager.update_status(task_uuid, "completed", email=persisted_success_result.email)
+                    logger.warning(
+                        "任务 %s 主流程已成功并落库，但收尾状态回写曾失败，已按 completed 补偿",
+                        task_uuid,
                     )
-
-                # 更新 TaskManager 状态
-                task_manager.update_status(task_uuid, "failed", error=str(e))
-            except:
-                pass
+            else:
+                try:
+                    with get_db() as recovery_db:
+                        crud.update_registration_task(
+                            recovery_db, task_uuid,
+                            status="failed",
+                            completed_at=utcnow_naive(),
+                            error_message=str(e)
+                        )
+                except Exception as recovery_error:
+                    logger.warning(f"任务 {task_uuid} failed 补偿回写失败: {recovery_error}")
+                finally:
+                    task_manager.update_status(task_uuid, "failed", error=str(e))
 
 
 async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_new_api: bool = False, new_api_service_ids: List[int] = None, registration_type: str = RoleTag.CHILD.value):
@@ -2041,6 +2221,7 @@ async def run_outlook_batch_registration(
     tm_service_ids: List[int] = None,
     auto_upload_new_api: bool = False,
     new_api_service_ids: List[int] = None,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """
     异步执行 Outlook 批量注册任务，复用通用并发逻辑
@@ -2086,6 +2267,7 @@ async def run_outlook_batch_registration(
         tm_service_ids=tm_service_ids,
         auto_upload_new_api=auto_upload_new_api,
         new_api_service_ids=new_api_service_ids,
+        registration_type=registration_type,
     )
 
 

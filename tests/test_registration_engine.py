@@ -1,10 +1,11 @@
 import base64
 import json
+from types import SimpleNamespace
 
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from src.core.register import RegistrationEngine, RegistrationResult
 from src.services.base import BaseEmailService
 
 
@@ -294,3 +295,185 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_run_continues_when_ip_location_is_unknown():
+    session_one = QueueSession([
+        ("GET", "https://auth.example.test/flow/1", _response_with_did("did-1")),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["PASSWORD_REGISTRATION"]}}),
+        ),
+        ("POST", OPENAI_API_ENDPOINTS["register"], DummyResponse(payload={})),
+        ("GET", OPENAI_API_ENDPOINTS["send_otp"], DummyResponse(payload={})),
+        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], DummyResponse(payload={})),
+        ("POST", OPENAI_API_ENDPOINTS["create_account"], DummyResponse(payload={})),
+    ])
+    session_two = QueueSession([
+        ("GET", "https://auth.example.test/flow/2", _response_with_did("did-2")),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]}}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["password_verify"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
+        ),
+        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], _response_with_login_cookies()),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue"}),
+        ),
+        (
+            "GET",
+            "https://auth.example.test/continue",
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "http://localhost:1455/auth/callback?code=code-2&state=state-2"},
+            ),
+        ),
+    ])
+
+    email_service = FakeEmailService(["123456", "654321"])
+    engine = RegistrationEngine(email_service)
+    fake_oauth = FakeOAuthManager()
+    engine.http_client = FakeOpenAIClient([session_one, session_two], ["sentinel-1", "sentinel-2"])
+    engine.http_client.check_ip_location = lambda: (False, None)
+    engine.oauth_manager = fake_oauth
+
+    result = engine.run()
+
+    assert result.success is True
+    assert any("IP 地理位置检测结果为空" in item for item in engine.logs)
+
+
+def test_check_ip_location_returns_unknown_when_trace_has_no_loc(monkeypatch):
+    client = OpenAIHTTPClient()
+    monkeypatch.setattr(client, "get", lambda url, timeout=10: DummyResponse(text="ip=1.1.1.1\nwarp=off\n"))
+
+    supported, location = client.check_ip_location()
+
+    assert supported is True
+    assert location is None
+
+
+def test_save_to_database_updates_existing_account(monkeypatch):
+    calls = {}
+    existing_account = SimpleNamespace(id=42, extra_data={"old": "value"})
+    fake_settings = SimpleNamespace(
+        openai_client_id="client-1",
+        openai_auth_url="https://auth.example.test/oauth/authorize",
+        openai_token_url="https://auth.example.test/oauth/token",
+        openai_redirect_uri="http://localhost:1455/auth/callback",
+        openai_scope="openid profile email",
+        registration_entry_flow="native",
+    )
+
+    class DummyDb:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("src.core.register.get_db", lambda: DummyDb())
+    monkeypatch.setattr("src.core.register.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("src.core.register.crud.get_account_by_email", lambda db, email: existing_account)
+
+    def fake_update_account(db, db_account_id, **kwargs):
+        calls["account_id"] = db_account_id
+        calls["kwargs"] = kwargs
+        return SimpleNamespace(id=db_account_id)
+
+    monkeypatch.setattr("src.core.register.crud.update_account", fake_update_account)
+
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+    monkeypatch.setattr(engine, "_dump_session_cookies", lambda: "cookie=a")
+
+    result = RegistrationResult(
+        success=True,
+        email="tester@example.com",
+        password="Passw0rd!",
+        account_id="acct-1",
+        workspace_id="ws-1",
+        access_token="access-1",
+        refresh_token="refresh-1",
+        id_token="id-1",
+        session_token="session-1",
+        metadata={"new": "value"},
+        source="register",
+    )
+
+    assert engine.save_to_database(result) is True
+    assert calls["account_id"] == 42
+    assert calls["kwargs"]["status"] == "active"
+    assert calls["kwargs"]["extra_data"] == {"old": "value", "new": "value"}
+    assert calls["kwargs"]["refresh_token"] == "refresh-1"
+    assert calls["kwargs"]["cookies"] == "cookie=a"
+
+
+def test_create_user_account_fallbacks_birthdate_to_ymd_and_age(monkeypatch):
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["create_account"],
+            DummyResponse(status_code=400, text='{"error":"invalid birthdate"}'),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["create_account"],
+            DummyResponse(status_code=400, text='{"error":"invalid ymd"}'),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["create_account"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/add-phone"}),
+        ),
+    ])
+
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+    monkeypatch.setattr(
+        "src.core.register.generate_random_user_info",
+        lambda: {"name": "Alice", "birthdate": "2000-02-20"},
+    )
+
+    assert engine._create_user_account() is True
+    assert len(session.calls) == 3
+
+    first_payload = json.loads(session.calls[0]["kwargs"]["data"])
+    second_payload = json.loads(session.calls[1]["kwargs"]["data"])
+    third_payload = json.loads(session.calls[2]["kwargs"]["data"])
+
+    assert first_payload == {"name": "Alice", "birthdate": "2000-02-20"}
+    assert second_payload["name"] == "Alice"
+    assert {"year", "month", "day"}.issubset(second_payload.keys())
+    assert third_payload["name"] == "Alice"
+    assert isinstance(third_payload.get("age"), int)
+
+
+def test_create_user_account_does_not_retry_on_non_shape_error(monkeypatch):
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["create_account"],
+            DummyResponse(status_code=403, text='{"error":"forbidden"}'),
+        ),
+    ])
+
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+    monkeypatch.setattr(
+        "src.core.register.generate_random_user_info",
+        lambda: {"name": "Alice", "birthdate": "2000-02-20"},
+    )
+
+    assert engine._create_user_account() is False
+    assert len(session.calls) == 1

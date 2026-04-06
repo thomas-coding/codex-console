@@ -1,5 +1,6 @@
 from src.config.constants import PASSWORD_SPECIAL_CHARSET
 from src.core import register as register_module
+from src.core.anyauto.oauth_client import OAuthClient
 from src.core.anyauto.register_flow import AnyAutoRegistrationEngine
 from src.core.register import RegistrationEngine
 from src.core.utils import generate_password
@@ -24,6 +25,14 @@ def test_registration_engine_generate_password_contains_special_characters():
 
 def test_anyauto_generate_password_contains_special_characters():
     _assert_password_is_hardened(AnyAutoRegistrationEngine._build_password(12))
+
+
+def test_anyauto_oauth_client_normalizes_full_authorize_url_to_origin():
+    client = OAuthClient({"oauth_issuer": "https://auth.example.test/oauth/authorize?client_id=abc"})
+    try:
+        assert client.oauth_issuer == "https://auth.example.test"
+    finally:
+        client.session.close()
 
 
 def test_register_password_with_retry_retries_generic_400(monkeypatch):

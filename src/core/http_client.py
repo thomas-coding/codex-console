@@ -282,14 +282,18 @@ class OpenAIHTTPClient(HTTPClient):
             loc_match = re.search(r"loc=([A-Z]+)", trace_text)
             loc = loc_match.group(1) if loc_match else None
 
+            if not loc:
+                logger.warning("未能解析 Cloudflare trace 的地理位置，按未知地区继续")
+                return True, None
+
             # 检查是否支持
             if loc in ["CN", "HK", "MO", "TW"]:
                 return False, loc
             return True, loc
 
         except Exception as e:
-            logger.error(f"检查 IP 地理位置失败: {e}")
-            return False, None
+            logger.warning(f"检查 IP 地理位置失败，按未知地区继续: {e}")
+            return True, None
 
     def send_openai_request(
         self,

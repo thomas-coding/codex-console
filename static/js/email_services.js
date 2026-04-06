@@ -366,9 +366,13 @@ function getCustomServiceAddress(service) {
         const baseUrl = service.config?.base_url || '-';
         const projectCode = service.config?.project_code || 'openai';
         const preferredDomain = service.config?.preferred_domain || '';
-        const detail = preferredDomain
+        const presetMailboxCount = Number(service.config?.preset_mailbox_count || 0);
+        let detail = preferredDomain
             ? `项目：${escapeHtml(projectCode)} / 优先域名：${escapeHtml(preferredDomain)}`
             : `项目：${escapeHtml(projectCode)}`;
+        if (presetMailboxCount > 0) {
+            detail += ` / 已购邮箱：${escapeHtml(String(presetMailboxCount))} 个`;
+        }
         return `${escapeHtml(baseUrl)}<div style="color: var(--text-muted); margin-top: 4px;">${detail}</div>`;
     }
     const baseUrl = service.config?.base_url || '-';
@@ -571,7 +575,8 @@ async function handleAddCustom(e) {
             api_key: formData.get('lm_api_key'),
             project_code: formData.get('lm_project_code') || 'openai',
             email_type: formData.get('lm_email_type') || 'ms_graph',
-            preferred_domain: formData.get('lm_preferred_domain')
+            preferred_domain: formData.get('lm_preferred_domain'),
+            preset_mailboxes: formData.get('lm_preset_mailboxes')
         };
     } else if (subType === 'freemail') {
         serviceType = 'freemail';
@@ -816,6 +821,7 @@ async function editCustomService(id, subType) {
             document.getElementById('edit-lm-project-code').value = service.config?.project_code || 'openai';
             document.getElementById('edit-lm-email-type').value = service.config?.email_type || 'ms_graph';
             document.getElementById('edit-lm-preferred-domain').value = service.config?.preferred_domain || '';
+            document.getElementById('edit-lm-preset-mailboxes').value = service.config?.preset_mailboxes || '';
         } else if (resolvedSubType === 'freemail') {
             document.getElementById('edit-fm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-fm-admin-token').value = '';
@@ -887,7 +893,8 @@ async function handleEditCustom(e) {
             base_url: formData.get('lm_base_url'),
             project_code: formData.get('lm_project_code') || 'openai',
             email_type: formData.get('lm_email_type') || 'ms_graph',
-            preferred_domain: formData.get('lm_preferred_domain')
+            preferred_domain: formData.get('lm_preferred_domain'),
+            preset_mailboxes: formData.get('lm_preset_mailboxes')
         };
         const apiKey = formData.get('lm_api_key');
         if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();

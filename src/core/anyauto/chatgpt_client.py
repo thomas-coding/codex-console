@@ -6,6 +6,7 @@ ChatGPT 注册客户端模块
 import random
 import uuid
 import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 try:
@@ -240,6 +241,60 @@ class ChatGPTClient:
         if state.continue_url and state.continue_url != state.current_url:
             return True
         return False
+
+    @staticmethod
+    def _compute_age_from_birthdate(birthdate):
+        text = str(birthdate or "").strip()
+        if not text:
+            return None
+        try:
+            dob = datetime.strptime(text, "%Y-%m-%d").date()
+            today = datetime.now().date()
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            return age if age > 0 else None
+        except Exception:
+            return None
+
+    def _build_about_you_payload_candidates(self, name, birthdate):
+        name = str(name or "").strip() or "Alex"
+        birthdate = str(birthdate or "").strip()
+
+        candidates = []
+        seen = set()
+
+        def _add(label, payload):
+            try:
+                key = str(sorted(payload.items()))
+            except Exception:
+                key = str(payload)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append((label, payload))
+
+        if birthdate:
+            _add("birthdate", {"name": name, "birthdate": birthdate})
+            try:
+                dob = datetime.strptime(birthdate, "%Y-%m-%d")
+                _add(
+                    "ymd",
+                    {
+                        "name": name,
+                        "year": int(dob.year),
+                        "month": int(dob.month),
+                        "day": int(dob.day),
+                    },
+                )
+            except Exception:
+                pass
+
+        age = self._compute_age_from_birthdate(birthdate)
+        if age:
+            _add("age", {"name": name, "age": int(age)})
+
+        if not candidates:
+            _add("fallback_name_only", {"name": name})
+        return candidates
 
     def _follow_flow_state(self, state: FlowState, referer=None):
         """跟随服务端返回的 continue_url，推进注册状态机。"""
@@ -704,29 +759,36 @@ class ChatGPTClient:
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
         headers.update(generate_datadog_trace())
-        
-        payload = {
-            "name": name,
-            "birthdate": birthdate,
-        }
-        
+
+        payload_candidates = self._build_about_you_payload_candidates(name, birthdate)
+        last_status = 0
+        last_error = ""
+
         try:
-            self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
-            
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    data = {}
-                next_state = self._state_from_payload(data, current_url=str(r.url) or self.BASE)
-                self._log(f"账号创建成功 {describe_flow_state(next_state)}")
-                return (True, next_state) if return_state else (True, "账号创建成功")
-            else:
-                error_msg = r.text[:200]
-                self._log(f"创建失败: {r.status_code} - {error_msg}")
-                return False, f"HTTP {r.status_code}"
-                
+            for idx, (label, payload) in enumerate(payload_candidates, start=1):
+                if idx > 1:
+                    self._log(f"about-you 字段兼容重试 ({idx}/{len(payload_candidates)}): {label}")
+
+                self._browser_pause()
+                r = self.session.post(url, json=payload, headers=headers, timeout=30)
+                last_status = int(r.status_code)
+
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {}
+                    next_state = self._state_from_payload(data, current_url=str(r.url) or self.BASE)
+                    self._log(f"账号创建成功 {describe_flow_state(next_state)}")
+                    return (True, next_state) if return_state else (True, "账号创建成功")
+
+                last_error = str(r.text or "")[:200]
+                self._log(f"创建失败[{label}]: {r.status_code} - {last_error}")
+                if idx < len(payload_candidates) and r.status_code in (400, 404, 409, 415, 422):
+                    continue
+                break
+
+            return False, f"HTTP {last_status}: {last_error}".strip()
         except Exception as e:
             self._log(f"创建异常: {e}")
             return False, str(e)

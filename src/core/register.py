@@ -363,8 +363,8 @@ class RegistrationEngine:
         try:
             return self.http_client.check_ip_location()
         except Exception as e:
-            self._log(f"检查 IP 地理位置失败: {e}", "error")
-            return False, None
+            self._log(f"检查 IP 地理位置失败，按未知地区继续: {e}", "warning")
+            return True, None
 
     def _create_email(self) -> bool:
         """创建邮箱"""
@@ -2328,63 +2328,159 @@ class RegistrationEngine:
 
         return False
 
-    def _create_user_account(self) -> bool:
-        """创建用户账户"""
+    @staticmethod
+    def _compute_age_from_birthdate(birthdate: str) -> Optional[int]:
+        text = str(birthdate or "").strip()
+        if not text:
+            return None
         try:
-            user_info = generate_random_user_info()
-            self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
-            create_account_body = json.dumps(user_info)
+            dob = datetime.strptime(text, "%Y-%m-%d").date()
+            today = datetime.now().date()
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            return age if age > 0 else None
+        except Exception:
+            return None
 
-            response = self.session.post(
-                OPENAI_API_ENDPOINTS["create_account"],
-                headers={
-                    "referer": "https://auth.openai.com/about-you",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
-                data=create_account_body,
-            )
+    def _build_about_you_payload_candidates(self, user_info: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+        name = str(user_info.get("name") or "").strip() or "Alex"
+        birthdate = str(user_info.get("birthdate") or "").strip()
 
-            self._log(f"账户创建状态: {response.status_code}")
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        seen_payloads: set[str] = set()
 
-            if response.status_code != 200:
-                self._log(f"账户创建失败: {response.text[:200]}", "warning")
-                return False
-
+        def _add(label: str, payload: Dict[str, Any]) -> None:
             try:
-                data = response.json() or {}
-                continue_url = str(data.get("continue_url") or "").strip()
-                if continue_url:
-                    self._create_account_continue_url = continue_url
-                    self._log(f"create_account 返回 continue_url，已缓存: {continue_url[:100]}...")
-                account_id = str(
-                    data.get("account_id")
-                    or data.get("chatgpt_account_id")
-                    or (data.get("account") or {}).get("id")
-                    or ""
-                ).strip()
-                if account_id:
-                    self._create_account_account_id = account_id
-                    self._log(f"create_account 返回 account_id，已缓存: {account_id}")
-                workspace_id = str(
-                    data.get("workspace_id")
-                    or data.get("default_workspace_id")
-                    or (data.get("workspace") or {}).get("id")
-                    or ""
-                ).strip()
-                if (not workspace_id) and isinstance(data.get("workspaces"), list) and data.get("workspaces"):
-                    workspace_id = str((data.get("workspaces")[0] or {}).get("id") or "").strip()
-                if workspace_id:
-                    self._create_account_workspace_id = workspace_id
-                    self._log(f"create_account 返回 workspace_id，已缓存: {workspace_id}")
-                refresh_token = str(data.get("refresh_token") or "").strip()
-                if refresh_token:
-                    self._create_account_refresh_token = refresh_token
-                    self._log("create_account 返回 refresh_token，已缓存")
+                key = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+            except Exception:
+                key = str(payload)
+            if key in seen_payloads:
+                return
+            seen_payloads.add(key)
+            candidates.append((label, payload))
+
+        if birthdate:
+            _add("birthdate", {"name": name, "birthdate": birthdate})
+            try:
+                dob = datetime.strptime(birthdate, "%Y-%m-%d")
+                _add(
+                    "ymd",
+                    {
+                        "name": name,
+                        "year": int(dob.year),
+                        "month": int(dob.month),
+                        "day": int(dob.day),
+                    },
+                )
             except Exception:
                 pass
 
-            return True
+        raw_age = user_info.get("age")
+        parsed_age: Optional[int] = None
+        try:
+            if raw_age not in (None, ""):
+                parsed_age = int(raw_age)
+        except Exception:
+            parsed_age = None
+        if parsed_age is None:
+            parsed_age = self._compute_age_from_birthdate(birthdate)
+        if parsed_age:
+            _add("age", {"name": name, "age": int(parsed_age)})
+
+        if not candidates:
+            _add("fallback_name_only", {"name": name})
+        return candidates
+
+    def _cache_create_account_response(self, data: Dict[str, Any]) -> None:
+        continue_url = str(data.get("continue_url") or "").strip()
+        if continue_url:
+            self._create_account_continue_url = continue_url
+            self._log(f"create_account 返回 continue_url，已缓存: {continue_url[:100]}...")
+        account_id = str(
+            data.get("account_id")
+            or data.get("chatgpt_account_id")
+            or (data.get("account") or {}).get("id")
+            or ""
+        ).strip()
+        if account_id:
+            self._create_account_account_id = account_id
+            self._log(f"create_account 返回 account_id，已缓存: {account_id}")
+        workspace_id = str(
+            data.get("workspace_id")
+            or data.get("default_workspace_id")
+            or (data.get("workspace") or {}).get("id")
+            or ""
+        ).strip()
+        if (not workspace_id) and isinstance(data.get("workspaces"), list) and data.get("workspaces"):
+            workspace_id = str((data.get("workspaces")[0] or {}).get("id") or "").strip()
+        if workspace_id:
+            self._create_account_workspace_id = workspace_id
+            self._log(f"create_account 返回 workspace_id，已缓存: {workspace_id}")
+        refresh_token = str(data.get("refresh_token") or "").strip()
+        if refresh_token:
+            self._create_account_refresh_token = refresh_token
+            self._log("create_account 返回 refresh_token，已缓存")
+
+    def _create_user_account(self) -> bool:
+        """创建用户账户（about-you 输入兼容：birthdate / ymd / age）。"""
+        try:
+            user_info = generate_random_user_info()
+            birthdate = str(user_info.get("birthdate") or "").strip()
+            age = self._compute_age_from_birthdate(birthdate)
+            if age:
+                self._log(f"生成用户信息: {user_info.get('name')}, 生日: {birthdate}, 年龄: {age}")
+            else:
+                self._log(f"生成用户信息: {user_info.get('name')}, 生日: {birthdate}")
+
+            payload_candidates = self._build_about_you_payload_candidates(user_info)
+            last_status_code: Optional[int] = None
+            last_error_preview = ""
+
+            for index, (label, payload) in enumerate(payload_candidates, start=1):
+                if index > 1:
+                    self._log(
+                        f"about-you 字段兼容重试 ({index}/{len(payload_candidates)}): {label}",
+                        "warning",
+                    )
+
+                response = self.session.post(
+                    OPENAI_API_ENDPOINTS["create_account"],
+                    headers={
+                        "referer": "https://auth.openai.com/about-you",
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                    },
+                    data=json.dumps(payload),
+                )
+
+                last_status_code = int(response.status_code)
+                self._log(f"账户创建状态[{label}]: {response.status_code}")
+
+                if response.status_code == 200:
+                    try:
+                        data = response.json() or {}
+                        self._cache_create_account_response(data)
+                    except Exception:
+                        pass
+                    return True
+
+                last_error_preview = str(response.text or "")[:200]
+                # 仅对常见参数不匹配错误继续尝试下一个 payload。
+                can_retry_shape = response.status_code in (400, 404, 409, 415, 422)
+                if index < len(payload_candidates) and can_retry_shape:
+                    self._log(
+                        f"about-you 提交未通过（{label}），尝试下一种输入格式...",
+                        "warning",
+                    )
+                    time.sleep(0.25)
+                    continue
+                break
+
+            self._log(
+                f"账户创建失败: HTTP {last_status_code if last_status_code is not None else 'unknown'} "
+                f"{last_error_preview}",
+                "warning",
+            )
+            return False
 
         except Exception as e:
             self._log(f"创建账户失败: {e}", "error")
@@ -2698,12 +2794,15 @@ class RegistrationEngine:
             # 1. 检查 IP 地理位置
             self._log("1. 先看看这条网络从哪儿来，别一开局就站错片场...")
             ip_ok, location = self._check_ip_location()
-            if not ip_ok:
+            if not ip_ok and location:
                 result.error_message = f"IP 地理位置不支持: {location}"
                 self._log(f"IP 检查失败: {location}", "error")
                 return result
 
-            self._log(f"IP 位置: {location}")
+            if location:
+                self._log(f"IP 位置: {location}")
+            else:
+                self._log("IP 地理位置检测结果为空，按 warning 继续执行", "warning")
 
             # 2. 创建邮箱
             self._log("2. 开个新邮箱，准备收信...")
@@ -2997,14 +3096,50 @@ class RegistrationEngine:
             settings = get_settings()
 
             with get_db() as db:
-                # 保存账户信息
+                existing = crud.get_account_by_email(db, result.email)
+                cookie_dump = self._dump_session_cookies()
+
+                if existing:
+                    merged_metadata = {}
+                    if isinstance(existing.extra_data, dict):
+                        merged_metadata.update(existing.extra_data)
+                    if isinstance(result.metadata, dict):
+                        merged_metadata.update(result.metadata)
+
+                    account = crud.update_account(
+                        db,
+                        existing.id,
+                        password=result.password or None,
+                        client_id=settings.openai_client_id or None,
+                        session_token=result.session_token or None,
+                        cookies=cookie_dump or None,
+                        email_service=self.email_service.service_type.value,
+                        email_service_id=(self.email_info.get("service_id") if self.email_info else None),
+                        account_id=result.account_id or None,
+                        workspace_id=result.workspace_id or None,
+                        access_token=result.access_token or None,
+                        refresh_token=result.refresh_token or None,
+                        id_token=result.id_token or None,
+                        proxy_used=self.proxy_url or None,
+                        extra_data=merged_metadata,
+                        source=result.source or None,
+                        status="active",
+                        account_label=account_label,
+                        role_tag=role_tag,
+                    )
+                    if not account:
+                        self._log("保存到数据库失败: 未找到可更新的账号记录", "error")
+                        return False
+                    self._log(f"账户已存在，已更新入库记录，ID: {account.id}")
+                    return True
+
                 account = crud.create_account(
                     db,
                     email=result.email,
                     password=result.password,
                     client_id=settings.openai_client_id,
                     session_token=result.session_token,
-                    cookies=self._dump_session_cookies(),
+                    cookies=cookie_dump,
                     email_service=self.email_service.service_type.value,
                     email_service_id=self.email_info.get("service_id") if self.email_info else None,
                     account_id=result.account_id,

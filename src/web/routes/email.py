@@ -7,12 +7,13 @@ from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from ...database import crud
 from ...database.session import get_db
 from ...database.models import EmailService as EmailServiceModel
 from ...database.models import Account as AccountModel
+from ...database.models import RegistrationTask as RegistrationTaskModel
 from ...config.settings import get_settings
 from ...services import EmailServiceFactory, EmailServiceType
 
@@ -98,6 +99,8 @@ SENSITIVE_FIELDS = {
     'custom_auth',
 }
 
+TERMINAL_REGISTRATION_TASK_STATUSES = {"completed", "failed", "cancelled"}
+
 def normalize_email_service_config(service_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """兼容历史配置字段，避免不同入口写入的键名不一致。"""
     normalized = dict(config or {})
@@ -112,6 +115,17 @@ def normalize_email_service_config(service_type: str, config: Optional[Dict[str,
     return normalized
 
 
+def count_preset_mailboxes(value: Any) -> int:
+    """统计 LuckMail 已购邮箱条数。"""
+    if not value:
+        return 0
+    if isinstance(value, str):
+        return len([line for line in value.splitlines() if str(line).strip()])
+    if isinstance(value, list):
+        return len([item for item in value if item not in (None, "")])
+    return 0
+
+
 def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """过滤敏感配置信息"""
     if not config:
@@ -119,6 +133,10 @@ def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     filtered = {}
     for key, value in config.items():
+        if key == "preset_mailboxes":
+            filtered["has_preset_mailboxes"] = bool(value)
+            filtered["preset_mailbox_count"] = count_preset_mailboxes(value)
+            continue
         if key in SENSITIVE_FIELDS:
             # 敏感字段不返回，但标记是否存在
             filtered[f"has_{key}"] = bool(value)
@@ -166,6 +184,44 @@ def service_to_response(service: EmailServiceModel) -> EmailServiceResponse:
         created_at=service.created_at.isoformat() if service.created_at else None,
         updated_at=service.updated_at.isoformat() if service.updated_at else None,
     )
+
+
+def _count_active_registration_tasks(db, service_id: int) -> int:
+    return (
+        db.query(func.count(RegistrationTaskModel.id))
+        .filter(RegistrationTaskModel.email_service_id == service_id)
+        .filter(
+            or_(
+                RegistrationTaskModel.status.is_(None),
+                RegistrationTaskModel.status.notin_(TERMINAL_REGISTRATION_TASK_STATUSES),
+            )
+        )
+        .scalar()
+        or 0
+    )
+
+
+def _ensure_email_service_deletable(db, service: EmailServiceModel) -> None:
+    active_task_count = _count_active_registration_tasks(db, service.id)
+    if active_task_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f'服务 "{service.name}" 仍被 {active_task_count} 个进行中的注册任务使用，无法删除',
+        )
+
+
+def _clear_registration_task_references(db, service_id: int) -> None:
+    (
+        db.query(RegistrationTaskModel)
+        .filter(RegistrationTaskModel.email_service_id == service_id)
+        .update({RegistrationTaskModel.email_service_id: None}, synchronize_session=False)
+    )
+
+
+def _delete_email_service_record(db, service: EmailServiceModel) -> None:
+    _ensure_email_service_deletable(db, service)
+    _clear_registration_task_references(db, service.id)
+    db.delete(service)
 
 
 # ============== API Endpoints ==============
@@ -343,10 +399,11 @@ async def get_service_types():
                 "description": "LuckMail 接码服务（下单 + 轮询验证码）",
                 "config_fields": [
                     {"name": "base_url", "label": "平台地址", "required": False, "default": "https://mails.luckyous.com/"},
-                    {"name": "api_key", "label": "API Key", "required": True, "secret": True},
+                    {"name": "api_key", "label": "API Key", "required": False, "secret": True},
                     {"name": "project_code", "label": "项目编码", "required": False, "default": "openai"},
                     {"name": "email_type", "label": "邮箱类型", "required": False, "default": "ms_graph"},
                     {"name": "preferred_domain", "label": "优先域名", "required": False, "placeholder": "outlook.com"},
+                    {"name": "preset_mailboxes", "label": "已购邮箱", "required": False, "placeholder": "邮箱----tok_xxx，每行一个"},
                     {"name": "poll_interval", "label": "轮询间隔(秒)", "required": False, "default": 3.0},
                 ]
             }
@@ -477,7 +534,7 @@ async def delete_email_service(service_id: int):
         if not service:
             raise HTTPException(status_code=404, detail="服务不存在")
 
-        db.delete(service)
+        _delete_email_service_record(db, service)
         db.commit()
 
         return {"success": True, "message": f"服务 {service.name} 已删除"}
@@ -669,18 +726,27 @@ async def batch_import_outlook(request: OutlookBatchImportRequest):
 @router.delete("/outlook/batch")
 async def batch_delete_outlook(service_ids: List[int]):
     """批量删除 Outlook 邮箱服务"""
-    deleted = 0
     with get_db() as db:
-        for service_id in service_ids:
-            service = db.query(EmailServiceModel).filter(
-                EmailServiceModel.id == service_id,
-                EmailServiceModel.service_type == "outlook"
-            ).first()
-            if service:
-                db.delete(service)
-                deleted += 1
+        unique_service_ids = list(dict.fromkeys(service_ids))
+        services = (
+            db.query(EmailServiceModel)
+            .filter(
+                EmailServiceModel.id.in_(unique_service_ids),
+                EmailServiceModel.service_type == "outlook",
+            )
+            .all()
+        )
+
+        for service in services:
+            _ensure_email_service_deletable(db, service)
+
+        for service in services:
+            _clear_registration_task_references(db, service.id)
+            db.delete(service)
+
         db.commit()
 
+    deleted = len(services)
     return {"success": True, "deleted": deleted, "message": f"已删除 {deleted} 个服务"}
 
 
